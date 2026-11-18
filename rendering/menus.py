@@ -50,6 +50,7 @@ from state.fsm import FSMContext
 if TYPE_CHECKING:
     from analysis.filter_presets import FilterProfile
     from bot.types import UserSettings
+    from handlers.scan_orchestration import ScoredResult
 
 DISCLAIMER = (
     "DexScan AI never holds your keys, never custodies funds, and never "
@@ -358,40 +359,78 @@ def render_my_filters() -> RenderedMessage:
     return RenderedMessage(html=html, keyboard=_kb(screen="my_filters"))
 
 
-def render_recent_results() -> RenderedMessage:
-    html = (
-        "\U0001f553 <b>Recent Results & Stats</b>\n\n"
-        "No scans yet this session. Results you view will show up here."
+def render_recent_results(
+    results: list[ScoredResult] | None = None,
+    batch_id: str | None = None,
+) -> RenderedMessage:
+    """Render the current process's bounded per-user scan history."""
+    from rendering.result_renderer import render_result_list
+
+    return render_result_list(
+        results or [],
+        batch_id=batch_id,
+        heading="Recent Results & Stats",
+        empty_message="No scans yet this session.",
+        scope_note="This session only; clears when the bot restarts.",
+        back_callback="nav_main",
     )
-    return RenderedMessage(html=html, keyboard=_kb(screen="recent_results"))
 
 
-def render_auto_watch(ctx: FSMContext, status: AutoWatchStatus | None = None) -> RenderedMessage:
+def render_auto_watch(
+    ctx: FSMContext,
+    status: AutoWatchStatus | None = None,
+    confirm_stop: bool = False,
+) -> RenderedMessage:
     """`status`, when given, is the real `AutoWatchManager.status()`
-    result (Step 12 [custom roadmap: Step 13]), used only to enrich the
-    detail text (which preset, interval, matches found). The Start/Stop
-    button itself is driven by `ctx.state` alone, exactly as it was
-    before this pass — the FSM is the authoritative signal for "is a
-    watch active," not this function's optional second argument, so a
-    caller that hasn't wired `status` through yet still gets a correct
-    button, just without the richer detail line."""
+    result (Step 12 [custom roadmap: Step 13]), used to show cycle
+    diagnostics and a View Results action when matches are cached. The
+    Start/Stop button itself is driven by `ctx.state`; `confirm_stop`
+    changes the active-screen controls to an explicit confirmation step."""
     active = ctx.state is FSMState.AUTO_WATCH_ACTIVE
     if active:
         if status is not None:
+            if status.last_cycle_discovery_failed:
+                cycle_detail = "The discovery feed couldn't be reached last cycle."
+            elif status.last_cycle_matches_found:
+                cycle_detail = f"Last cycle found {status.last_cycle_matches_found} qualifying result(s)."
+            elif status.last_cycle_candidates_scanned:
+                scanned_label = "candidate" if status.last_cycle_candidates_scanned == 1 else "candidates"
+                scanned_verb = "was" if status.last_cycle_candidates_scanned == 1 else "were"
+                cycle_detail = (
+                    f"{status.last_cycle_candidates_scanned} {scanned_label} {scanned_verb} scanned "
+                    "but none matched last cycle."
+                )
+            elif status.last_cycle_scan_failures:
+                cycle_detail = "No candidate scans completed last cycle."
+            else:
+                cycle_detail = "No qualifying results yet."
+            if status.last_cycle_scan_failures:
+                cycle_detail += f" Candidate scan failures: {status.last_cycle_scan_failures}."
             detail = (
                 f"Status: <b>running</b> ({escape_html(status.profile_name.title())} filter, "
                 f"checking every {status.interval_min} min)\n"
-                f"Matches found this session: {status.matches_found}\n\n"
+                f"Matches found this session: {status.matches_found}\n"
+                f"{escape_html(cycle_detail)}\n\n"
             )
         else:
             detail = "Status: <b>running</b>.\n\n"
+        stop_prompt = "\n\n<b>Confirm stop?</b> Auto-Watch keeps running unless you confirm." if confirm_stop else ""
         html = (
             "\U0001f441 <b>Auto-Watch</b>\n\n"
             f"{detail}"
             "Background monitoring only — every match still needs your tap "
             "on Result Detail before anything else happens."
+            f"{stop_prompt}"
         )
-        rows = [[InlineKeyboardButton(text="\u23f9 Stop", callback_data="watch_stop")]]
+        if confirm_stop:
+            rows = [[
+                InlineKeyboardButton(text="\u2705 Confirm Stop", callback_data="watch_stop_confirm"),
+                InlineKeyboardButton(text="\u25c0\ufe0f Keep Running", callback_data="watch_stop_cancel"),
+            ]]
+        else:
+            rows = [[InlineKeyboardButton(text="\u23f9 Stop", callback_data="watch_stop")]]
+        if status is not None and status.matched_result_ids:
+            rows.insert(0, [InlineKeyboardButton(text="\U0001f4cb View Results", callback_data="watch_view_results")])
     else:
         html = (
             "\U0001f441 <b>Auto-Watch</b>\n\n"

@@ -25,7 +25,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiogram.types import CallbackQuery, User
+from aiogram.types import CallbackQuery, Message, User
 
 from analysis.api_abstraction import DiscoveryCandidate, PairData, SecurityReport
 from analysis.core_engine import CoreEngine, CoreResult
@@ -440,8 +440,9 @@ def _fake_callback(data: str, user_id: int) -> CallbackQuery:
     cq.data = data
     cq.from_user = MagicMock(spec=User, id=user_id)
     cq.answer = AsyncMock()
-    cq.message = MagicMock()
+    cq.message = MagicMock(spec=Message)
     cq.message.edit_text = AsyncMock()
+    cq.message.answer = AsyncMock()
     return cq
 
 
@@ -535,6 +536,15 @@ async def test_trade_staging_back_returns_to_result_detail() -> None:
 
     assert fsm.get_state(user_id).state is FSMState.RESULT_DETAIL
     assert "Trade Staging" not in _rendered_html(cq)
+    detail_markup = cq.message.edit_text.await_args.kwargs["reply_markup"]
+    back_to_list = next(
+        button.callback_data
+        for row in detail_markup.inline_keyboard
+        for button in row
+        if (button.callback_data or "").startswith("result_back_list:")
+    )
+    await dispatcher.dispatch(_fake_callback(back_to_list, user_id))
+    assert fsm.get_state(user_id).state is FSMState.RESULT_READY
 
 
 @pytest.mark.asyncio
@@ -560,27 +570,33 @@ async def test_watch_alert_result_view_and_buy_button_all_reach_the_same_trade_s
 ) -> None:
     """Document-of-record for Part VIII Step 11's own integration
     requirement, restated in this session's own resume instructions:
-    Auto-Watch match -> alert -> result_view:{uuid} -> Result Detail ->
+    Auto-Watch match -> alert -> result_view:{uuid}:watch -> Result Detail ->
     Trade Staging -> approval, with no second execution path anywhere.
     Proven here by actually walking that exact chain through the real
     Dispatcher, starting from `render_watch_alert`'s own callback_data -
     not asserted, read directly off the rendered alert. Also the
-    regression test for documented adjacency addition #7
-    (state/fsm.py): seeds AUTO_WATCH_ACTIVE - where a real alert
-    recipient actually is - rather than Idle, so a revert of that
-    addition fails this test with the exact InvalidTransitionError a
-    real user would have hit."""
+    regression test for documented additions #7 and #9
+    (state/fsm.py): the alert may be opened while the user is on the Main
+    Menu, so a revert of the direct-entry edge fails this test with the
+    exact InvalidTransitionError a real user would have hit."""
     dispatcher, fsm, session_store = _build_dispatcher_stack()
     user_id = 105
     result_id, scored = _cached(session_store)
 
     alert = render_watch_alert(scored)
     alert_callbacks = {b.callback_data for row in alert.keyboard.inline_keyboard for b in row if b.callback_data}
-    assert f"result_view:{result_id}" in alert_callbacks
+    assert f"result_view:{result_id}:watch" in alert_callbacks
 
-    _seed_state(session_store, user_id, FSMState.AUTO_WATCH_ACTIVE)  # where a real alert recipient would be
-    await dispatcher.dispatch(_fake_callback(f"result_view:{result_id}", user_id))
+    _seed_state(session_store, user_id, FSMState.IDLE)  # a running watch is independent of the current menu screen
+    detail = _fake_callback(f"result_view:{result_id}:watch", user_id)
+    await dispatcher.dispatch(detail)
     assert fsm.get_state(user_id).state is FSMState.RESULT_DETAIL
+    detail_markup = detail.message.answer.await_args.kwargs["reply_markup"]
+    assert any(
+        button.callback_data == "nav_watch"
+        for row in detail_markup.inline_keyboard
+        for button in row
+    )
 
     await dispatcher.dispatch(_fake_callback(f"exec_stage:{result_id}", user_id))
     assert fsm.get_state(user_id).state is FSMState.TRADE_STAGING

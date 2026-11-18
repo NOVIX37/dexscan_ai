@@ -6,7 +6,7 @@ InvalidTransitionError.
 
 The expected-valid table below is hand-encoded independently from
 `state.fsm._ADJACENCY`, so this test actually checks the implementation
-against the playbook's Part II.4 table (plus the seven documented
+against the playbook's Part II.4 table (plus the documented
 additions justified by Part II.5/II.9 - see state/fsm.py's module
 docstring) rather than checking the map against itself.
 
@@ -26,9 +26,12 @@ from state.fsm import FSMContext, FSMEngine, InvalidTransitionError
 from state.session_store import SessionStore
 
 _EXPECTED_VALID: dict[FSMState, set[FSMState]] = {
+    # documented addition #9: Auto-Watch alerts remain reachable from
+    # the Main Menu because the watch task is independent of FSM state.
     FSMState.IDLE: {
         FSMState.IDLE, FSMState.AWAITING_ADDRESS, FSMState.CONFIGURING_FILTER,
-        FSMState.SCANNING, FSMState.AUTO_WATCH_ACTIVE, FSMState.ERROR,
+        FSMState.SCANNING, FSMState.RESULT_READY, FSMState.RESULT_DETAIL,
+        FSMState.AUTO_WATCH_ACTIVE, FSMState.ERROR,
     },
     FSMState.AWAITING_ADDRESS: {FSMState.SCANNING, FSMState.IDLE, FSMState.ERROR},
     # documented addition #8 (Step 12 revalidation) - Advanced Rules'
@@ -37,16 +40,22 @@ _EXPECTED_VALID: dict[FSMState, set[FSMState]] = {
         FSMState.CONFIGURING_FILTER, FSMState.SCANNING, FSMState.IDLE, FSMState.ERROR,
     },
     FSMState.SCANNING: {FSMState.RESULT_READY, FSMState.IDLE, FSMState.ERROR},
-    FSMState.RESULT_READY: {FSMState.RESULT_DETAIL, FSMState.IDLE, FSMState.ERROR},
+    # documented addition #11: pagination/restoration updates this screen.
+    FSMState.RESULT_READY: {
+        FSMState.RESULT_READY, FSMState.RESULT_DETAIL, FSMState.IDLE,
+        FSMState.AUTO_WATCH_ACTIVE, FSMState.ERROR,
+    },
     # RESULT_DETAIL: documented addition #4 - Trade Staging's Back target
     # (Part II.9) is Result Detail, not just the approve/abort-to-Idle
     # outcomes Part II.4's literal table shows. Documented addition #5 -
     # SCANNING, for Step 7's Rescan button (found missing via a real
     # pytest run; this sandbox can't execute the handler code that
     # actually needs this edge).
+    # documented addition #10: the alert detail's Back target is the
+    # still-running Auto-Watch screen.
     FSMState.RESULT_DETAIL: {
         FSMState.TRADE_STAGING, FSMState.RESULT_READY, FSMState.IDLE,
-        FSMState.SCANNING, FSMState.ERROR,
+        FSMState.AUTO_WATCH_ACTIVE, FSMState.SCANNING, FSMState.ERROR,
     },
     FSMState.TRADE_STAGING: {
         # documented addition #6 (Step 11) - "Change Target Bot" stays here.
@@ -55,7 +64,7 @@ _EXPECTED_VALID: dict[FSMState, set[FSMState]] = {
     # documented addition #7 (Step 11) - AUTO_WATCH_ACTIVE -> RESULT_DETAIL,
     # for an alert's own "View Full Report" (see state/fsm.py's docstring).
     FSMState.AUTO_WATCH_ACTIVE: {
-        FSMState.AUTO_WATCH_ACTIVE, FSMState.IDLE, FSMState.RESULT_DETAIL, FSMState.ERROR,
+        FSMState.AUTO_WATCH_ACTIVE, FSMState.IDLE, FSMState.RESULT_DETAIL, FSMState.RESULT_READY, FSMState.ERROR,
     },
     # Documented addition #3 (state/fsm.py): fully permissive, since "the
     # failed state" is dynamic per user, not a fixed pair.

@@ -50,7 +50,7 @@ from analysis.momentum_engine import MomentumEngine, MomentumResult
 from analysis.security_engine import SecurityEngine, SecurityResult
 from analysis.social_engine import SocialEngine, SocialResult
 from bot.constants import Chain
-from scoring.pipeline import ScoringPipeline, ScoringResult
+from scoring.pipeline import ScoringPipeline, ScoringResult, ScoringResultV4
 from scoring.risk_opportunity_matrix import RiskOpportunityTier, classify
 from state.session_store import SessionStore
 
@@ -77,8 +77,8 @@ class ScoredResult:
     holder: HolderResult
     momentum: MomentumResult
     social: SocialResult
-    scoring: ScoringResult
-    risk_opportunity: RiskOpportunityTier
+    scoring: ScoringResult | ScoringResultV4
+    risk_opportunity: RiskOpportunityTier | None
     result_id: str = ""
 
 
@@ -97,6 +97,7 @@ async def run_scan(
     on_holder_complete: ProgressHook | None = None,
     on_social_complete: ProgressHook | None = None,
     on_momentum_complete: ProgressHook | None = None,
+    user_id: int | None = None,
 ) -> ScoredResult:
     """
     Chains Core -> (Security || Holder || Social) -> Momentum -> Scoring
@@ -212,6 +213,6 @@ async def run_scan(
         scoring=scoring_result,
         risk_opportunity=risk_opportunity,
     )
-    result_id = session_store.cache_put(scored)
+    result_id = session_store.cache_put(scored, user_id=user_id)
     scored.result_id = result_id
     return scored

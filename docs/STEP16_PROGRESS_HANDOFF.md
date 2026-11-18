@@ -111,6 +111,14 @@ choke point that always appends the correct footer row, and
 `rendering/result_renderer.py`'s Result/Trade/Watch screens use their
 own equivalent `_back_home_row()`. A new screen cannot ship without one.
 
+### RM-1 follow-up
+
+The cancellation limitation above was subsequently resolved: on-demand
+and discovery scans register their active task, and `scan_cancel` now
+cancels and awaits that task. Cancellation during the parallel engine
+phase is covered by
+`test_scan_flow_integration.py::test_cancelling_during_parallel_engines_leaves_no_partial_result`.
+
 ## Architecture audit (Part II/V invariants) — PASS, with evidence
 
 | Invariant | Result | Evidence |
@@ -200,3 +208,115 @@ $ pip install -r requirements.txt && python3 -m pytest -q
   found and fixed. Full 8-flow trace, Part V.9 line-by-line review, and
   the mypy hygiene backlog remain before this step can honestly be
   marked complete.
+
+## Remediation continuation — RM-14 Session History
+
+`nav_recent` now uses a per-user handler instead of the static navigation
+table. Successful manual and discovery scans enter the bounded
+current-process history; Auto-Watch adds only qualifying matches. The
+screen renders cached results with page controls and states that history
+is session-only and clears on restart. A fresh `SessionStore` has no
+history, and result-list navigation uses `RESULT_READY` so pagination and
+detail callbacks remain valid.
+
+Focused verification: `pytest -q tests/test_fsm.py
+tests/test_scan_flow_integration.py tests/test_auto_watch.py
+tests/test_session_store.py tests/test_result_renderer.py
+tests/test_menus.py` — **179 passed**. Signature compatibility check
+confirmed all 13 `run_scan` call sites remain valid after adding the
+optional `user_id` parameter. The complete RM-0–RM-14 plan is still in
+progress; this section records RM-14 only.
+
+## Remediation continuation — RM-8, RM-6, RM-13
+
+RM-8 Auto-Watch visibility now distinguishes discovery outages, completed
+cycles with no matches, and scan failures; matched results are browsable
+from cached data, and stopping requires confirmation. The bounded
+last-cycle status and match list remain in memory. Its focused
+Auto-Watch/FSM/menu suite passed **134 tests**.
+
+RM-6's multi-entry audit identified Result Detail and Result Ready as
+screens with real alternate entry paths. Auto-Watch alert callbacks now
+carry an origin tag and return from Result Detail to the active
+Auto-Watch screen. Result lists retain the originating cached batch and
+page in FSM context, so Back from a detail restores the same Discovery,
+Recent Results, or Auto-Watch list/page. A direct alert can also be
+opened while the user is on the Main Menu. Regression coverage exercises
+those paths, including detail-to-trade-staging-to-detail. The focused
+FSM, scan, watch, trading, and session-store tests passed **177 tests**.
+
+RM-13 adds a closed `SocialReasonCode` vocabulary: `NO_API_KEY`,
+`ACCOUNT_NOT_FOUND`, `RATE_LIMITED`, `PROVIDER_TIMEOUT`,
+`TRANSPORT_ERROR`, and `INSUFFICIENT_DATA`. The provider preserves the
+final HTTP 429 and timeout distinction after retries, rejects a blank
+key before network I/O, and account-not-found remains based on the
+provider's documented successful response shape. The renderer gives
+each code distinct copy. Partial and insufficient results remain
+`degraded=False`, preserving existing v3 scoring inputs. Social engine,
+provider, renderer, v3 scoring, and orchestration tests passed **90
+tests**.
+
+RM-7 was approved as Option 1: routine navigation remains edit-in-place,
+while Result Detail and completed discovery-batch results are sent as new
+messages. Discovery progress is finalized before the result message is
+sent, so no stale "Scanning" screen is left behind. Focused scan, watch,
+trading, and dispatcher integration tests passed **84 tests**; tests
+assert the new-message path does not edit the originating callback
+message.
+
+Final combined verification after these changes:
+`.venv\Scripts\python.exe -m pytest -q` — **600 passed**. The run emits
+existing `pytest-asyncio` deprecation warnings. RM-9's diagnostic report
+now records this final suite result; the scoring diagnostic itself and
+all production scoring formulas/v1-v2-v3 dispatch remain unchanged.
+
+The current branch remains `feature/rm-09-scoring-diagnostic`; changes
+are uncommitted. RM-0 remains blocked on human credential rotation.
+RM-7 Option 1 is approved and implemented. RM-10's component boundary,
+score direction, exclusion-based missing-data rules, coverage reporting,
+zero-coverage behavior, numeric normalization, and the revised
+conservative Security component are owner-approved in
+`docs/SCORING_COMPONENT_CONTRACT.md`. RM-11 adds an explicitly selected
+v4 scoring path and rendered coverage manifest without changing the
+default v1/v2/v3 dispatch. The v4 fixture matrix scored 3,304 of 3,780
+cases (476 returned Insufficient Data); the 72-case synthetic matrix
+scored 32.22–52.22 (mean/median 42.22). The one-day low-risk example
+moved from v3 9.88 to v4 52.22 at 75% coverage. Full suite after the
+Security revision: **614 passed**;
+targeted strict mypy for the modified scoring/rendering/orchestration/
+diagnostic modules passed. No live APIs were called.
+
+The owner directed that the Risk/Opportunity Matrix be omitted for v4
+only; existing version behavior remains unchanged. The owner approved
+and RM-11 now implements the revised Security mapping
+(`min(trust_score, 100 - HCI, 100 - vulnerability_penalty)`). High-trust/
+no-flag fixture scores were 37.22–71.64 (median 54.06), versus honeypots
+at 15.56–45.13 (median 30.73). These still overlap: 19 safe cases scored
+below 45 and 4 honeypots at or above 45. RM-12 remains blocked by the owner's decision
+to keep v4 uncalibrated; no
+replacement tier bands are defined.
+RM-0 remains blocked on human credential rotation; B1-B3 remain deferred
+backlog per the plan.
+
+## Remediation status summary
+
+| Module | Status | Evidence / remaining blocker |
+|---|---|---|
+| RM-0 Credential security | **BLOCKED** | Repository hygiene check is present; human credential rotation/revocation is still required. |
+| RM-1 Scan lifecycle | **COMPLETE** | Duplicate-scan guard, progress feedback, and task cancellation; integration tests cover in-flight cancellation and cleanup. |
+| RM-2 Direct address detection | **COMPLETE** | Valid address paste from IDLE, non-address fallback, and trade-staging protection are tested. |
+| RM-3 Session result index | **COMPLETE** | Bounded per-user history and batch cache round trips, isolation, and unknown IDs are tested. |
+| RM-4 Discovery screening | **COMPLETE** | Deduplication, profile filtering, counts, empty-state, provider failures, and paid-promotion disclosure are tested. |
+| RM-5 Pagination | **COMPLETE** | Cached batch pagination and stale/malformed callback recovery are tested without rescanning. |
+| RM-6 Navigation back-stack | **COMPLETE** | Origin-aware detail/back paths and existing list pages are covered by integration tests. |
+| RM-7 Message preservation UX | **COMPLETE** | Owner-approved Option 1 is implemented; focused scan/watch/trading/dispatcher tests passed. |
+| RM-8 Auto-Watch visibility | **COMPLETE** | Distinct cycle outcomes, browsable matches, and stop confirmation are implemented and tested. |
+| RM-9 Scoring diagnostics | **COMPLETE** | Fixture/synthetic runner and report record actual v3/v4 calculations; no live provider calls. |
+| RM-10 Component contract | **COMPLETE** | Hybrid boundaries, polarity, exclusions, coverage, and revised Security mapping are owner-approved and documented. |
+| RM-11 Experimental scoring | **COMPLETE** | Opt-in v4, revised Security formula, renderer coverage, and focused/full verification; production default remains v3. |
+| RM-12 Tier calibration | **BLOCKED** | Owner chose to keep v4 uncalibrated after safe/honeypot fixture scores still overlap. |
+| RM-13 Social diagnostics | **COMPLETE** | Closed reason-code vocabulary and provider/renderer behavior are implemented and tested. |
+| RM-14 Session history | **COMPLETE** | Per-user current-session results are browsable; restart/session-only limits are explicit. |
+| B1 Filters | **PARTIAL** | Existing filters work; saving/naming multiple custom presets remains deferred. |
+| B2 EVM coverage | **BLOCKED** | EVM security/holder provider and verification work is a separate, unscheduled scope. |
+| B3 Production hardening | **BLOCKED** | Durable work, deployment, monitoring, and broader type cleanup await the persistence/operations architecture decision. |

@@ -7,26 +7,26 @@ Isolated and independently testable, matching `CoreEngine`/
 provider satisfying `SocialDataProvider` (Part V.2, dependency
 inversion), never a concrete `TwitterApiIoProvider` import in this file.
 
-Scope note (matching Steps 8/9's own precedent): this module builds and
-tests the engine in isolation only. Wiring a constructed `SocialEngine`
-into `main.py`'s composition root, `scan_orchestration.run_scan`, and
-`result_renderer.py`'s placeholder is deliberately deferred — Part
-VIII Step 13's own Integration Requirements say as much explicitly
-("Step 14's wiring passes a real SocialResult into both
-ScoringPipeline.score and MomentumEngine.compute"), and both of those
-call sites already accept `social` as an optional, currently-`None`
-parameter for exactly this reason (Steps 6 and 9's forward-compatible
-design).
+The engine is wired into `main.py` and `scan_orchestration.run_scan`;
+this module owns provider-failure classification while the renderer
+turns its closed reason-code vocabulary into user-facing diagnostics.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from analysis.api_abstraction import SocialDataProvider, Tweet, XUserProfile
+from analysis.api_abstraction import (
+    SocialDataProvider,
+    SocialProviderError,
+    SocialReasonCode,
+    Tweet,
+    XUserProfile,
+)
 from bot.constants import INFLUENCER_FOLLOWER_THRESHOLD
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,12 @@ class SocialResult:
     per-follower timestamp here to reuse. A future provider exposing
     that field could close this gap without changing this dataclass's
     shape.
+
+    `reason_code` is set for a fully unavailable lookup, a partial
+    secondary-call failure, or a successful lookup with no follower
+    sample and no recent mentions. Partial/insufficient results remain
+    `degraded=False` so this diagnostic addition does not change the
+    existing v3 scoring inputs.
     """
 
     x_score: int
@@ -119,9 +125,10 @@ class SocialResult:
     follower_growth_pct: float
     degraded: bool = False
     degraded_reason: str | None = None
+    reason_code: SocialReasonCode | None = None
 
 
-def _degraded_result(reason: str) -> SocialResult:
+def _degraded_result(reason: str, reason_code: SocialReasonCode) -> SocialResult:
     """The one place a fully-degraded SocialResult gets constructed -
     same pattern as core_engine.py/security_engine.py/holder_engine.py's
     own `_degraded_result`/`_empty_result` helpers. Neutral defaults: an
@@ -137,7 +144,27 @@ def _degraded_result(reason: str) -> SocialResult:
         follower_growth_pct=0.0,
         degraded=True,
         degraded_reason=reason,
+        reason_code=reason_code,
     )
+
+
+def _reason_code_for_exception(exc: Exception) -> SocialReasonCode:
+    if isinstance(exc, SocialProviderError):
+        return exc.reason_code
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return SocialReasonCode.PROVIDER_TIMEOUT
+    return SocialReasonCode.TRANSPORT_ERROR
+
+
+def _reason_detail(reason_code: SocialReasonCode) -> str:
+    return {
+        SocialReasonCode.NO_API_KEY: "Social provider API key is not configured.",
+        SocialReasonCode.ACCOUNT_NOT_FOUND: "No X/Twitter account was found for this token.",
+        SocialReasonCode.RATE_LIMITED: "The social provider rate limit was reached.",
+        SocialReasonCode.PROVIDER_TIMEOUT: "The social provider timed out.",
+        SocialReasonCode.TRANSPORT_ERROR: "The social provider request failed.",
+        SocialReasonCode.INSUFFICIENT_DATA: "No follower sample or recent mentions were returned.",
+    }[reason_code]
 
 
 def _compute_x_score(profile: XUserProfile) -> int:
@@ -247,22 +274,30 @@ class SocialEngine:
         latency-sensitive UI moment don't need `asyncio.gather`'s added
         complexity to be correct).
         """
+        reason_code: SocialReasonCode | None = None
+        degraded_reason: str | None = None
         try:
             profile = await self._provider.lookup_user(handle_or_ticker)
         except Exception as exc:
+            reason_code = _reason_code_for_exception(exc)
             logger.warning(
                 "Social data provider failed on user lookup",
                 extra={"handle": handle_or_ticker, "error": str(exc)},
             )
-            return _degraded_result("Couldn't reach the social data provider. Try again shortly.")
+            return _degraded_result(_reason_detail(reason_code), reason_code)
 
         if not profile.account_exists:
-            return _degraded_result(f"No X/Twitter account found for @{handle_or_ticker}.")
+            return _degraded_result(
+                f"No X/Twitter account found for @{handle_or_ticker}.",
+                SocialReasonCode.ACCOUNT_NOT_FOUND,
+            )
 
         followers: list[XUserProfile] = []
         try:
             followers = await self._provider.list_followers(handle_or_ticker, limit=_FOLLOWER_SAMPLE_SIZE)
         except Exception as exc:
+            reason_code = _reason_code_for_exception(exc)
+            degraded_reason = _reason_detail(reason_code)
             logger.warning(
                 "Follower sample lookup failed; verified_follower_ratio falls back to its neutral default",
                 extra={"handle": handle_or_ticker, "error": str(exc)},
@@ -272,10 +307,17 @@ class SocialEngine:
         try:
             mentions = await self._provider.search_mentions(handle_or_ticker)
         except Exception as exc:
+            if reason_code is None:
+                reason_code = _reason_code_for_exception(exc)
+                degraded_reason = _reason_detail(reason_code)
             logger.warning(
                 "Mention search failed; sentiment/frequency/influencer data fall back to their neutral defaults",
                 extra={"handle": handle_or_ticker, "error": str(exc)},
             )
+
+        if reason_code is None and not followers and not mentions:
+            reason_code = SocialReasonCode.INSUFFICIENT_DATA
+            degraded_reason = _reason_detail(reason_code)
 
         influencer_count = sum(
             1
@@ -294,4 +336,6 @@ class SocialEngine:
             influencer_mention_count=influencer_count,
             sentiment_ratio=_compute_sentiment_ratio(mentions),
             follower_growth_pct=0.0,  # documented permanent gap - see SocialResult's own docstring
+            degraded_reason=degraded_reason,
+            reason_code=reason_code,
         )

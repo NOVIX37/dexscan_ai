@@ -46,13 +46,21 @@ class AutoWatchStatus:
     """Part VIII Step 12's Public Interface — `AutoWatchManager.status`'s
     return type (handlers/auto_watch.py). A plain read-only snapshot, not
     the live `asyncio.Task` itself — nothing outside that module should
-    ever touch a raw Task (Part V.2: composition over exposing internals)."""
+    ever touch a raw Task (Part V.2: composition over exposing internals).
+    Matched result IDs are bounded and session-scoped; the last-cycle
+    fields distinguish feed outages, scan failures, and completed scans
+    that produced no matches."""
 
     user_id: int
     profile_name: str
     interval_min: int
     matches_found: int
     started_at: datetime
+    matched_result_ids: list[str] = field(default_factory=list)
+    last_cycle_discovery_failed: bool = False
+    last_cycle_scan_failures: int = 0
+    last_cycle_candidates_scanned: int = 0
+    last_cycle_matches_found: int = 0
 
 
 @dataclass

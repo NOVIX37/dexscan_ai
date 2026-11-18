@@ -79,3 +79,24 @@ async def send_rendered(event: TelegramEvent, rendered: RenderedMessage) -> None
     into a `reply()` call — the one place a handler converts "which screen
     to show" into an actual Telegram API call."""
     await reply(event, rendered.html, keyboard=rendered.keyboard)
+
+
+async def send_new_rendered(event: TelegramEvent, rendered: RenderedMessage) -> None:
+    """Send a rendered screen as a new chat message without replacing the
+    callback's current message."""
+    if isinstance(event, Message):
+        await event.answer(rendered.html, parse_mode="HTML", reply_markup=rendered.keyboard)
+        return
+
+    message = event.message
+    if message is None:
+        raise RuntimeError("Cannot send a new chat message for an inline callback without a message.")
+    if isinstance(message, Message):
+        await message.answer(rendered.html, parse_mode="HTML", reply_markup=rendered.keyboard)
+        return
+    await event.bot.send_message(
+        chat_id=message.chat.id,
+        text=rendered.html,
+        parse_mode="HTML",
+        reply_markup=rendered.keyboard,
+    )

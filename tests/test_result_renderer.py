@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardMarkup
 
+from analysis.api_abstraction import SocialReasonCode
 from analysis.core_engine import CoreResult
 from analysis.holder_engine import HolderResult
 from analysis.momentum_engine import MomentumResult
@@ -238,6 +239,31 @@ def test_social_section_shows_unavailable_reason_when_degraded() -> None:
     assert "Not yet available" not in rendered.html  # degraded, not unbuilt - different wording on purpose
 
 
+def test_social_reason_codes_render_distinct_cause_specific_copy() -> None:
+    cases = (
+        (SocialReasonCode.NO_API_KEY, True, "No API key is configured"),
+        (SocialReasonCode.ACCOUNT_NOT_FOUND, True, "No X/Twitter account was found"),
+        (SocialReasonCode.RATE_LIMITED, True, "temporarily rate-limited"),
+        (SocialReasonCode.PROVIDER_TIMEOUT, True, "provider timed out"),
+        (SocialReasonCode.TRANSPORT_ERROR, True, "could not be reached"),
+        (SocialReasonCode.INSUFFICIENT_DATA, False, "No recent mentions or sampled followers"),
+    )
+    rendered_html: list[str] = []
+
+    for reason_code, degraded, expected_copy in cases:
+        social = _social_result(
+            reason_code=reason_code,
+            degraded=degraded,
+            degraded_reason="same generic fallback",
+        )
+        html = render_result_detail(_scored_result(social=social)).html
+        assert expected_copy in html
+        assert "same generic fallback" not in html
+        rendered_html.append(html)
+
+    assert len(set(rendered_html)) == len(cases)
+
+
 def test_holder_section_shows_live_data_not_placeholder() -> None:
     """Ask #5: HCI/Top-10 concentration, holder count, whale count, and
     insider-cluster status must all come from the real HolderResult, not
@@ -428,9 +454,12 @@ def test_result_list_button_carries_result_id_and_score() -> None:
 
 def test_result_list_pagination_appears_beyond_five_results() -> None:
     results = [_scored_result(result_id=f"r{i}") for i in range(7)]
-    rendered = render_result_list(results, page=0)
+    batch_id = "a" * 32
+    rendered = render_result_list(results, page=0, batch_id=batch_id)
     callbacks = _all_callback_data(rendered)
-    assert "result_page:1" in callbacks
+    next_page = f"result_page:{batch_id}:1"
+    assert next_page in callbacks
+    assert len(next_page.encode("utf-8")) <= 64
     # page 0 shows exactly 5 result buttons + nav row + back/home row
     result_buttons = [c for c in callbacks if c.startswith("result_view:")]
     assert len(result_buttons) == 5
@@ -438,8 +467,18 @@ def test_result_list_pagination_appears_beyond_five_results() -> None:
 
 def test_result_list_page_out_of_range_clamps_not_crashes() -> None:
     results = [_scored_result(result_id=f"r{i}") for i in range(7)]
-    rendered = render_result_list(results, page=99)
+    rendered = render_result_list(results, page=99, batch_id="batch-id")
     assert isinstance(rendered.keyboard, InlineKeyboardMarkup)  # didn't raise
+
+
+def test_result_list_requires_batch_id_for_pagination() -> None:
+    results = [_scored_result(result_id=f"r{i}") for i in range(7)]
+    try:
+        render_result_list(results)
+    except ValueError as exc:
+        assert "batch_id" in str(exc)
+    else:
+        raise AssertionError("Paginated result lists must have a cached batch ID")
 
 
 def test_result_list_back_target_is_scan_menu() -> None:

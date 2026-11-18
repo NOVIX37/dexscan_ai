@@ -8,44 +8,49 @@ The Telegram-I/O shell around `handlers.auto_watch.AutoWatchManager` and
 stay aiogram-free and independently testable; this file is what actually
 sends/edits messages, reads callback params, and transitions FSM state.
 
-Owns six callback commands `handlers/navigation.py`'s own docstring
-listed as "not built yet" before this pass: `watch_start`, `watch_stop`
-(Auto-Watch's Start/Stop), `rule_preset:*` (Filter Config's presets),
-`scan_trending`, `scan_new` (Scan Menu's two discovery buttons — Paste
-was already `ScanHandler`'s). Also takes over `nav_watch`/`nav_filters`
-from `handlers/navigation.py`'s `_NAV_TARGETS`, since both now need real
-data (an `AutoWatchStatus`, a real preset) that lookup table has no way
-to supply.
+Owns Auto-Watch lifecycle and visibility callbacks, `rule_preset:*`
+(Filter Config's presets), and `scan_trending`/`scan_new` (Scan Menu's
+two discovery buttons — Paste was already `ScanHandler`'s). Also takes
+over `nav_watch`/`nav_filters` from `handlers/navigation.py`'s
+`_NAV_TARGETS`, since both need real per-user data that lookup table
+cannot supply.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram.types import CallbackQuery
 
 from analysis.core_engine import CoreEngine
 from analysis.filter_presets import (
+    FilterProfile,
     NAMED_PRESETS,
     cycle_numeric_field,
     default_custom_profile,
+    matches,
     set_bool_field,
 )
 from analysis.holder_engine import HolderEngine
 from analysis.momentum_engine import MomentumEngine
 from analysis.security_engine import SecurityEngine
 from analysis.social_engine import SocialEngine
-from bot.constants import FSMState
+from bot.constants import EVM_CHAINS, Chain, FSMState
+from bot.types import EngineStatus
 from handlers.auto_watch import AutoWatchManager
-from handlers.base import TelegramEvent, send_rendered
+from handlers.base import TelegramEvent, reply, send_new_rendered, send_rendered
 from handlers.callback_parser import parse_callback
-from handlers.scan_orchestration import run_scan
+from handlers.scan_orchestration import ScoredResult, run_scan
+from rendering.error_renderer import RECOVERY_HOME
 from rendering.error_renderer import render_error
 from rendering.menus import (
     render_advanced_rules,
     render_auto_watch,
     render_filter_config,
     render_my_filters,
+    render_plain,
+    render_scanning_progress,
 )
 from rendering.result_renderer import render_result_list, render_watch_alert
 from scoring.pipeline import ScoringPipeline
@@ -57,6 +62,7 @@ logger = logging.getLogger(__name__)
 _OWNED_COMMANDS = frozenset(
     {
         "nav_watch", "nav_filters", "watch_start", "watch_stop",
+        "watch_stop_confirm", "watch_stop_cancel", "watch_view_results",
         "rule_preset", "scan_trending", "scan_new",
         # Step 12 revalidation additions: Advanced Rules / Custom Filter,
         # previously unhandled placeholders (rule_advanced had no owner
@@ -75,6 +81,7 @@ _DEFAULT_INTERVAL_MIN = 10
 _MAX_DISCOVERY_SCAN_CANDIDATES = 10  # bounds an on-demand Trending/New tap's own latency + provider cost
 
 _DISCOVERY_FETCH_FAILED_ERROR = "Couldn't reach the discovery feed just now."
+_SCAN_ALREADY_RUNNING_HTML = "<b>A scan is already running.</b> Please wait for it to finish or cancel it first."
 
 
 class WatchHandler:
@@ -158,11 +165,23 @@ class WatchHandler:
             return
 
         if parsed.command == "watch_stop":
-            await self._handle_watch_stop(event, user_id)
+            await self._handle_watch_stop_request(event, user_id, ctx)
+            return
+
+        if parsed.command == "watch_stop_confirm":
+            await self._handle_watch_stop_confirm(event, user_id)
+            return
+
+        if parsed.command == "watch_stop_cancel":
+            await self._handle_watch_stop_cancel(event, user_id, ctx)
+            return
+
+        if parsed.command == "watch_view_results":
+            await self._handle_watch_view_results(event, user_id)
             return
 
         if parsed.command in ("scan_trending", "scan_new"):
-            await self._handle_discovery_scan(event, user_id, source=parsed.command)
+            await self._handle_discovery_scan(event, user_id, source=parsed.command, ctx=ctx)
             return
 
     async def _handle_preset_selected(self, event: CallbackQuery, user_id: int, params: list[str]) -> None:
@@ -253,34 +272,151 @@ class WatchHandler:
         same Balanced fallback only for the edge case of a "custom"
         selection with no draft ever built (e.g. picked from Filter
         Config's preset row without ever opening Advanced Rules)."""
-        preset_key = ctx.payload.get("selected_filter_preset", "balanced")
-        if preset_key == "custom":
-            profile = ctx.payload.get("custom_filter_draft") or NAMED_PRESETS["balanced"]
-        else:
-            profile = NAMED_PRESETS.get(preset_key, NAMED_PRESETS["balanced"])
+        if await self._reject_if_scan_active(event, user_id):
+            return
+        profile = self._selected_filter_profile(ctx)
 
         new_ctx = self._fsm.transition(user_id, FSMState.AUTO_WATCH_ACTIVE)
         await self._auto_watch_manager.start(user_id, profile, interval_min=_DEFAULT_INTERVAL_MIN)
         status = self._auto_watch_manager.status(user_id)
         await send_rendered(event, render_auto_watch(new_ctx, status=status))
 
-    async def _handle_watch_stop(self, event: CallbackQuery, user_id: int) -> None:
+    async def _handle_watch_stop_request(
+        self, event: CallbackQuery, user_id: int, ctx: FSMContext
+    ) -> None:
+        status = self._auto_watch_manager.status(user_id)
+        if status is None:
+            new_ctx = self._fsm.transition(user_id, FSMState.IDLE) if ctx.state is not FSMState.IDLE else ctx
+            await send_rendered(event, render_auto_watch(new_ctx))
+            return
+        active_ctx = ctx
+        if ctx.state is not FSMState.AUTO_WATCH_ACTIVE:
+            active_ctx = self._fsm.transition(user_id, FSMState.AUTO_WATCH_ACTIVE)
+        await send_rendered(event, render_auto_watch(active_ctx, status=status, confirm_stop=True))
+
+    async def _handle_watch_stop_confirm(self, event: CallbackQuery, user_id: int) -> None:
         await self._auto_watch_manager.stop(user_id)
-        new_ctx = self._fsm.transition(user_id, FSMState.IDLE)
+        current_state = self._fsm.get_state(user_id).state
+        new_ctx = self._fsm.transition(user_id, FSMState.IDLE) if current_state is not FSMState.IDLE else self._fsm.get_state(user_id)
         await send_rendered(event, render_auto_watch(new_ctx, status=None))
 
-    async def _handle_discovery_scan(self, event: CallbackQuery, user_id: int, source: str) -> None:
+    async def _handle_watch_stop_cancel(
+        self, event: CallbackQuery, user_id: int, ctx: FSMContext
+    ) -> None:
+        status = self._auto_watch_manager.status(user_id)
+        if status is None:
+            new_ctx = self._fsm.transition(user_id, FSMState.IDLE) if ctx.state is not FSMState.IDLE else ctx
+            await send_rendered(event, render_auto_watch(new_ctx))
+            return
+        active_ctx = ctx
+        if ctx.state is not FSMState.AUTO_WATCH_ACTIVE:
+            active_ctx = self._fsm.transition(user_id, FSMState.AUTO_WATCH_ACTIVE)
+        await send_rendered(event, render_auto_watch(active_ctx, status=status))
+
+    async def _handle_watch_view_results(self, event: CallbackQuery, user_id: int) -> None:
+        status = self._auto_watch_manager.status(user_id)
+        if status is None:
+            await send_rendered(
+                event,
+                render_error(
+                    "Auto-Watch is no longer active.",
+                    technical_detail=None,
+                    recovery_action=RECOVERY_HOME,
+                ),
+            )
+            return
+
+        results: list[ScoredResult] = []
+        for result_id in status.matched_result_ids:
+            cached = self._session_store.cache_get(result_id)
+            if isinstance(cached, ScoredResult):
+                results.append(cached)
+            else:
+                logger.warning(
+                    "Auto-Watch match has no cached scan result",
+                    extra={"user_id": user_id, "result_id": result_id},
+                )
+
+        if not results:
+            current_ctx = self._fsm.get_state(user_id)
+            if current_ctx.state is not FSMState.AUTO_WATCH_ACTIVE:
+                current_ctx = self._fsm.transition(user_id, FSMState.AUTO_WATCH_ACTIVE)
+            await send_rendered(event, render_auto_watch(current_ctx, status=status))
+            return
+
+        batch_id = None
+        if results:
+            batch_id = self._session_store.cache_put_batch(
+                user_id,
+                [result.result_id for result in results],
+                {
+                    "heading": "Auto-Watch Matches",
+                    "source_note": "Matches found by Auto-Watch this session.",
+                    "scope_note": "This session only; clears when the bot restarts.",
+                    "back_callback": "nav_watch",
+                },
+            )
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=batch_id,
+            result_list_page=0,
+        )
+        await send_rendered(
+            event,
+            render_result_list(
+                results,
+                batch_id=batch_id,
+                heading="Auto-Watch Matches",
+                source_note="Matches found by Auto-Watch this session.",
+                scope_note="This session only; clears when the bot restarts.",
+                back_callback="nav_watch",
+            ),
+        )
+
+    def _selected_filter_profile(self, ctx: FSMContext) -> FilterProfile:
+        preset_key = ctx.payload.get("selected_filter_preset", "balanced")
+        if preset_key == "custom":
+            draft = ctx.payload.get("custom_filter_draft")
+            return draft if isinstance(draft, FilterProfile) else NAMED_PRESETS["balanced"]
+        return NAMED_PRESETS.get(preset_key, NAMED_PRESETS["balanced"])
+
+    async def _handle_discovery_scan(
+        self, event: CallbackQuery, user_id: int, source: str, ctx: FSMContext
+    ) -> None:
         """On-demand version of what Auto-Watch does on a timer: fetch
         candidates from the discovery feed named by this specific button
         (Trending -> boosted, New -> new_listings — see
         `TokenDiscoveryProvider`'s own docstring for what each actually
-        means), scan every one through the real pipeline, show them all
-        as a Result List. No filter applied here (unlike Auto-Watch,
-        this is "show me what's out there right now," not "alert me on
-        a match"), and bounded to `_MAX_DISCOVERY_SCAN_CANDIDATES` so one
-        tap can't trigger an unbounded number of scans."""
+        means), filter through the user's selected Auto-Watch profile
+        (Balanced until one is selected), and show only matches. The
+        candidate count is bounded to `_MAX_DISCOVERY_SCAN_CANDIDATES`
+        so one tap cannot trigger an unbounded number of scans."""
+        if await self._reject_if_scan_active(event, user_id):
+            return
         self._fsm.transition(user_id, FSMState.SCANNING)
+        profile = self._selected_filter_profile(ctx)
+        task = asyncio.create_task(self._run_discovery_scan(event, user_id, source, profile))
+        self._session_store.set_scan_task(user_id, task)
+        try:
+            await task
+        except asyncio.CancelledError:
+            self._fsm.transition(user_id, FSMState.IDLE)
+        finally:
+            if self._session_store.get_scan_task(user_id) is task:
+                self._session_store.pop_scan_task(user_id)
 
+    async def _run_discovery_scan(
+        self, event: CallbackQuery, user_id: int, source: str, profile: FilterProfile
+    ) -> None:
+        progress_state: dict[str, EngineStatus] = {
+            "core": EngineStatus.RUNNING,
+            "security": EngineStatus.PENDING,
+            "holder": EngineStatus.PENDING,
+            "social": EngineStatus.PENDING,
+            "momentum": EngineStatus.PENDING,
+        }
+        await send_rendered(event, render_scanning_progress(progress_state))
         try:
             if source == "scan_trending":
                 candidates = await self._discovery_provider.get_trending(limit=_MAX_DISCOVERY_SCAN_CANDIDATES)
@@ -301,22 +437,78 @@ class WatchHandler:
             )
             return
 
-        results = []
+        unique_candidates = []
+        seen_addresses: set[tuple[Chain, str]] = set()
         for candidate in candidates:
+            address = candidate.token_address.strip()
+            normalized_address = address.lower() if candidate.chain in EVM_CHAINS else address
+            dedupe_key = (candidate.chain, normalized_address)
+            if dedupe_key in seen_addresses:
+                continue
+            seen_addresses.add(dedupe_key)
+            unique_candidates.append(candidate)
+
+        counts = {
+            "discovered": len(unique_candidates),
+            "analyzed": 0,
+            "rejected": 0,
+            "displayed": 0,
+            "failed": 0,
+        }
+        results = []
+        for candidate in unique_candidates:
             try:
                 scored = await run_scan(
                     candidate.token_address,
                     self._core_engine, self._security_engine, self._holder_engine,
                     self._momentum_engine, self._social_engine, self._scoring_pipeline, self._session_store,
                     chain_hint=candidate.chain,
+                    user_id=user_id,
                 )
-                results.append(scored)
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                counts["failed"] += 1
                 logger.warning(
                     "Discovery scan failed for one candidate, skipping it",
-                    extra={"user_id": user_id, "address": candidate.token_address},
+                    extra={"user_id": user_id, "address": candidate.token_address, "error": str(exc)},
                 )
                 continue
+            counts["analyzed"] += 1
+            if matches(profile, scored):
+                results.append(scored)
+            else:
+                counts["rejected"] += 1
 
-        self._fsm.transition(user_id, FSMState.RESULT_READY)
-        await send_rendered(event, render_result_list(results))
+        counts["displayed"] = len(results)
+        source_note = (
+            "Trending includes paid boosts; a boost is paid promotion, not evidence of organic interest."
+            if source == "scan_trending"
+            else "New Listings reflects recently updated token profiles, not necessarily newly created pools."
+        )
+        batch_meta = {**counts, "source_note": source_note}
+        batch_id = self._session_store.cache_put_batch(
+            user_id,
+            [result.result_id for result in results],
+            batch_meta,
+        )
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=batch_id,
+            result_list_page=0,
+        )
+        await reply(event, "<b>Discovery scan complete.</b> Results are shown in the next message.")
+        await send_new_rendered(
+            event,
+            render_result_list(results, summary=counts, source_note=source_note, batch_id=batch_id),
+        )
+
+    async def _reject_if_scan_active(self, event: CallbackQuery, user_id: int) -> bool:
+        task = self._session_store.get_scan_task(user_id)
+        if task is not None and not task.done():
+            await send_rendered(event, render_plain(_SCAN_ALREADY_RUNNING_HTML, back_callback="nav_scan"))
+            return True
+        if task is not None:
+            self._session_store.pop_scan_task(user_id)
+        return False

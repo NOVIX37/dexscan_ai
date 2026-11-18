@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Protocol
 
 from bot.constants import Chain
@@ -337,6 +338,25 @@ class Tweet:
     author_follower_count: int
     author_is_verified: bool
     created_at: datetime | None
+
+
+class SocialReasonCode(str, Enum):
+    """Closed vocabulary for unavailable or insufficient social data."""
+
+    NO_API_KEY = "no_api_key"
+    ACCOUNT_NOT_FOUND = "account_not_found"
+    RATE_LIMITED = "rate_limited"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    TRANSPORT_ERROR = "transport_error"
+    INSUFFICIENT_DATA = "insufficient_data"
+
+
+class SocialProviderError(RuntimeError):
+    """A provider failure with a machine-readable cause for SocialEngine."""
+
+    def __init__(self, reason_code: SocialReasonCode, message: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(message)
 
 
 class SocialDataProvider(Protocol):

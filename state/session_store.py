@@ -19,6 +19,8 @@ from typing import Any
 
 from bot.types import SessionContext, UserSettings
 
+_USER_HISTORY_LIMIT = 50
+
 
 class SessionStore:
     """Process-wide, in-memory-only session + UUID cache + background-task
@@ -27,6 +29,10 @@ class SessionStore:
     def __init__(self) -> None:
         self._sessions: dict[int, SessionContext] = {}
         self._uuid_cache: dict[str, Any] = {}
+        self._user_history: dict[int, list[str]] = {}
+        self._batch_cache: dict[str, tuple[int, list[str], dict[str, Any]]] = {}
+        self._scan_tasks: dict[int, asyncio.Task[Any]] = {}
+        self._scan_task_sources: dict[int, str] = {}
         self._watch_tasks: dict[int, asyncio.Task] = {}
         self._settings: dict[int, UserSettings] = {}
 
@@ -39,12 +45,16 @@ class SessionStore:
         """Store (or replace) a user's session context."""
         self._sessions[user_id] = ctx
 
-    def cache_put(self, payload: Any) -> str:
+    def cache_put(self, payload: Any, user_id: int | None = None) -> str:
         """Store a large payload (a scan result, a custom filter object)
         that would not fit in a 64-byte callback_data string, and return the
-        short key a button can carry instead (Part II.7, tier 2)."""
+        short key a button can carry instead (Part II.7, tier 2). When
+        `user_id` is provided, also record the result in that user's
+        bounded, current-process history."""
         key = uuid.uuid4().hex
         self._uuid_cache[key] = payload
+        if user_id is not None:
+            self.add_to_user_history(user_id, key)
         return key
 
     def cache_get(self, key: str) -> Any | None:
@@ -52,6 +62,67 @@ class SessionStore:
         an unknown or already-expired key rather than raising, since a stale
         button tap is an expected, recoverable event (Part II.5)."""
         return self._uuid_cache.get(key)
+
+    def add_to_user_history(self, user_id: int, result_id: str) -> None:
+        """Record a result as the user's most recent history entry.
+
+        History is process-local and capped independently of any requested
+        read limit so it cannot grow without bound.
+        """
+        history = self._user_history.setdefault(user_id, [])
+        history.insert(0, result_id)
+        del history[_USER_HISTORY_LIMIT:]
+
+    def get_user_history(self, user_id: int, limit: int = _USER_HISTORY_LIMIT) -> list[str]:
+        """Return the user's newest result IDs first, up to the requested
+        limit. Unknown users and non-positive limits return an empty list."""
+        history = self._user_history.get(user_id, [])
+        return list(history[: max(0, min(limit, _USER_HISTORY_LIMIT))])
+
+    def cache_put_batch(
+        self,
+        user_id: int,
+        result_ids: list[str],
+        meta: dict[str, Any],
+    ) -> str:
+        """Cache an ordered result-ID batch and its display metadata.
+
+        The user ID is retained with the batch for its per-user association.
+        Copies are stored so later caller mutations cannot change the cached
+        pagination snapshot.
+        """
+        batch_id = uuid.uuid4().hex
+        self._batch_cache[batch_id] = (user_id, list(result_ids), dict(meta))
+        return batch_id
+
+    def cache_get_batch(self, batch_id: str) -> tuple[list[str], dict[str, Any]] | None:
+        """Return copies of a batch's result IDs and metadata, or None for
+        an unknown batch ID."""
+        batch = self._batch_cache.get(batch_id)
+        if batch is None:
+            return None
+        _, result_ids, meta = batch
+        return list(result_ids), dict(meta)
+
+    def set_scan_task(
+        self, user_id: int, task: asyncio.Task[Any], source: str = "interactive"
+    ) -> None:
+        """Register the active on-demand or Auto-Watch scan for a user."""
+        self._scan_tasks[user_id] = task
+        self._scan_task_sources[user_id] = source
+
+    def get_scan_task(self, user_id: int) -> asyncio.Task[Any] | None:
+        """Return the user's active scan task, if one is registered."""
+        return self._scan_tasks.get(user_id)
+
+    def get_scan_task_source(self, user_id: int) -> str | None:
+        """Return the source of the registered scan, if present."""
+        return self._scan_task_sources.get(user_id)
+
+    def pop_scan_task(self, user_id: int) -> asyncio.Task[Any] | None:
+        """Remove and return the user's registered scan task."""
+        self._scan_task_sources.pop(user_id, None)
+        return self._scan_tasks.pop(user_id, None)
 
     # -- Auto-Watch background-task registry (Step 12) ---------------------
     #

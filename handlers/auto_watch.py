@@ -44,6 +44,7 @@ from state.session_store import SessionStore
 logger = logging.getLogger(__name__)
 
 OnMatchHook = Callable[[int, ScoredResult], Awaitable[None]]
+_AUTO_WATCH_MATCH_HISTORY_LIMIT = 50
 
 
 class AutoWatchManager:
@@ -203,19 +204,36 @@ class AutoWatchManager:
         )
 
         while True:
+            status = self._statuses.get(user_id)
+            cycle_discovery_failed = False
+            cycle_scan_failures = 0
+            cycle_candidates_scanned = 0
+            cycle_matches_found = 0
+
             try:
                 candidates = await self._discovery_provider.get_new_listings()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("Auto-Watch discovery fetch failed this cycle", extra={"user_id": user_id, "error": str(exc)})
+                cycle_discovery_failed = True
                 candidates = []
 
             for candidate in candidates:
                 if candidate.token_address in alerted_addresses:
                     continue
-                try:
-                    scored = await run_scan(
+                active_scan = self._session_store.get_scan_task(user_id)
+                if active_scan is not None and not active_scan.done():
+                    logger.debug(
+                        "Auto-Watch candidate skipped because another scan is active",
+                        extra={"user_id": user_id, "address": candidate.token_address},
+                    )
+                    continue
+                if active_scan is not None:
+                    self._session_store.pop_scan_task(user_id)
+
+                scan_task = asyncio.create_task(
+                    run_scan(
                         candidate.token_address,
                         self._core_engine,
                         self._security_engine,
@@ -226,6 +244,10 @@ class AutoWatchManager:
                         self._session_store,
                         chain_hint=candidate.chain,
                     )
+                )
+                self._session_store.set_scan_task(user_id, scan_task, source="auto_watch")
+                try:
+                    scored = await scan_task
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -233,13 +255,21 @@ class AutoWatchManager:
                         "Auto-Watch scan failed for one candidate, skipping it",
                         extra={"user_id": user_id, "address": candidate.token_address, "error": str(exc)},
                     )
+                    cycle_scan_failures += 1
                     continue
+                finally:
+                    if self._session_store.get_scan_task(user_id) is scan_task:
+                        self._session_store.pop_scan_task(user_id)
 
+                cycle_candidates_scanned += 1
                 if matches(profile, scored):
                     alerted_addresses.add(candidate.token_address)
-                    status = self._statuses.get(user_id)
+                    self._session_store.add_to_user_history(user_id, scored.result_id)
                     if status is not None:
                         status.matches_found += 1
+                        status.matched_result_ids.insert(0, scored.result_id)
+                        del status.matched_result_ids[_AUTO_WATCH_MATCH_HISTORY_LIMIT:]
+                    cycle_matches_found += 1
                     try:
                         await self._on_match(user_id, scored)
                     except asyncio.CancelledError:
@@ -247,4 +277,9 @@ class AutoWatchManager:
                     except Exception:
                         logger.exception("Auto-Watch on_match hook raised", extra={"user_id": user_id})
 
+            if status is not None:
+                status.last_cycle_discovery_failed = cycle_discovery_failed
+                status.last_cycle_scan_failures = cycle_scan_failures
+                status.last_cycle_candidates_scanned = cycle_candidates_scanned
+                status.last_cycle_matches_found = cycle_matches_found
             await asyncio.sleep(interval_seconds)

@@ -3,12 +3,9 @@ Layer: State — FSM engine (Playbook Part VIII Step 2; table in Part II.4).
 
 Encodes the conversation as a static adjacency map: which states each
 state may transition to. Built from Part II.4's literal "Exits to" column
-plus seven documented deviations (was "four" through Step 7's own patch;
-corrected here in passing while adding #6/#7 below, itself a small
-instance of the same "flag it explicitly, don't let small drift
-accumulate silently" rule this list already exists to demonstrate) —
-flagged here rather than silently patched, per the playbook's own "flag
-it explicitly" rule (see the "How To Use This Document" section):
+plus documented deviations, flagged here rather than silently patched,
+per the playbook's own "flag it explicitly" rule (see the "How To Use
+This Document" section):
 
 1. Part II.4 doesn't literally list IDLE as an exit of AWAITING_ADDRESS,
    SCANNING, or RESULT_DETAIL — but Part II.5's universal Back/Home rule,
@@ -68,12 +65,18 @@ it explicitly" rule (see the "How To Use This Document" section):
    this edge is not an edge case: without it, every single real
    Auto-Watch alert's own "View Full Report" button raises
    `InvalidTransitionError` on first tap, caught only by Dispatcher's
-   generic safety net. One-directional on purpose — the watch itself
-   isn't paused by looking at one alert's detail (no explicit "resume
-   watching" action exists to pair a reverse edge with); returning to
-   Idle (already valid from Result Detail) and re-opening Auto-Watch
-   from the Main Menu shows the same still-running status either way,
-   proven in `tests/test_watch_flow_integration.py`.
+   generic safety net. The watch itself isn't paused by looking at one
+   alert; the alert's Back action returns to the running watch screen.
+8. CONFIGURING_FILTER -> CONFIGURING_FILTER: rule toggles and numeric
+    adjustments update the same configuration screen.
+9. IDLE -> RESULT_DETAIL: an Auto-Watch alert is a separate message and
+   can be opened while the user is on the Main Menu; the watch task is
+   independent of the current FSM screen.
+10. RESULT_DETAIL -> AUTO_WATCH_ACTIVE: the alert's detail Back button
+   returns to the still-running watch, rather than a single-result list.
+11. RESULT_READY -> RESULT_READY: changing result pages and restoring a
+    list after detail navigation updates the visible page without
+    leaving Result Ready.
 """
 
 from __future__ import annotations
@@ -118,6 +121,8 @@ _ADJACENCY: dict[FSMState, set[FSMState]] = {
         FSMState.AWAITING_ADDRESS,     # Scan Menu -> Paste Contract Address
         FSMState.CONFIGURING_FILTER,   # Scan Menu -> Custom Filter
         FSMState.SCANNING,             # Scan Menu -> Trending Pairs / New Listings (direct)
+        FSMState.RESULT_READY,         # Recent Results opens a cached result list
+        FSMState.RESULT_DETAIL,        # documented addition #9 - Auto-Watch alert can open from Main Menu
         FSMState.AUTO_WATCH_ACTIVE,    # Main Menu -> Auto-Watch -> Start
     },
     FSMState.AWAITING_ADDRESS: {
@@ -141,13 +146,16 @@ _ADJACENCY: dict[FSMState, set[FSMState]] = {
         FSMState.IDLE,                 # documented addition #1 - user cancelled
     },
     FSMState.RESULT_READY: {
+        FSMState.RESULT_READY,         # documented addition #11 - update the current cached-list page
         FSMState.RESULT_DETAIL,        # a result tapped
         FSMState.IDLE,                 # Home
+        FSMState.AUTO_WATCH_ACTIVE,    # Back from Auto-Watch's matched-result list
     },
     FSMState.RESULT_DETAIL: {
         FSMState.TRADE_STAGING,        # Buy tapped
         FSMState.RESULT_READY,         # Back to list
         FSMState.IDLE,                 # documented addition #1 - Home
+        FSMState.AUTO_WATCH_ACTIVE,    # documented addition #10 - Auto-Watch alert detail's Back target
         FSMState.SCANNING,             # documented addition #5 - Rescan (Step 7)
     },
     FSMState.TRADE_STAGING: {
@@ -166,6 +174,7 @@ _ADJACENCY: dict[FSMState, set[FSMState]] = {
                                         # "View Full Report" (result_view, same handler
                                         # Result List's button uses) - the watch itself
                                         # keeps running in the background either way.
+        FSMState.RESULT_READY,         # browse Auto-Watch's cached matched-result list
     },
 }
 

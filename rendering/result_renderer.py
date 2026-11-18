@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from analysis.api_abstraction import SocialReasonCode
 from analysis.core_engine import CoreResult
 from analysis.holder_engine import HolderResult
 from analysis.momentum_engine import MomentumResult
@@ -40,10 +41,19 @@ from handlers.scan_orchestration import ScoredResult
 from integrations.providers import BOT_PROVIDERS
 from rendering.html_utils import escape_html
 from rendering.menus import DISCLAIMER, HOME_CALLBACK, RenderedMessage
-from scoring.pipeline import ScoringResult
+from scoring.pipeline import ScoringResult, ScoringResultV4
 from scoring.risk_opportunity_matrix import RiskOpportunityTier
 
 _RESULTS_PER_PAGE = 5
+
+_SOCIAL_REASON_COPY: dict[SocialReasonCode, str] = {
+    SocialReasonCode.NO_API_KEY: "No API key is configured for social analysis.",
+    SocialReasonCode.ACCOUNT_NOT_FOUND: "No X/Twitter account was found for this token.",
+    SocialReasonCode.RATE_LIMITED: "Social lookup is temporarily rate-limited.",
+    SocialReasonCode.PROVIDER_TIMEOUT: "The social data provider timed out.",
+    SocialReasonCode.TRANSPORT_ERROR: "The social data provider could not be reached.",
+    SocialReasonCode.INSUFFICIENT_DATA: "No recent mentions or sampled followers were available.",
+}
 
 # Public block explorers, one per supported chain (Part II.6) — stable,
 # long-established URL conventions, not the kind of versioned API detail
@@ -252,7 +262,53 @@ def _momentum_section(momentum: MomentumResult) -> str:
     return "\n".join(lines)
 
 
-def _score_section(scoring: ScoringResult) -> str:
+def _score_summary(scoring: ScoringResult | ScoringResultV4, include_scale: bool = False) -> str:
+    if isinstance(scoring, ScoringResultV4):
+        if scoring.total_score is None:
+            return "Insufficient Data (v4)"
+        return f"{scoring.total_score:.0f} (Uncalibrated v4)"
+    if include_scale:
+        return f"{scoring.score_ai:.0f}/100 \u2014 {escape_html(scoring.tier_label)}"
+    return f"{scoring.score_ai:.0f} ({escape_html(scoring.tier_label)})"
+
+
+def _score_section(scoring: ScoringResult | ScoringResultV4) -> str:
+    if isinstance(scoring, ScoringResultV4):
+        if scoring.total_score is None:
+            score_line = "AI Score: <b>Insufficient Data</b>"
+        else:
+            score_line = (
+                f"Experimental AI Score: <b>{scoring.total_score:.0f}/100</b> "
+                "\u2014 Uncalibrated v4"
+            )
+        coverage_line = (
+            f"Coverage: {scoring.coverage_pct:.0f}% "
+            f"({len(scoring.included_components)} of 4 components included)"
+        )
+        explanation_lines = [
+            f"\u2022 {escape_html(name)} component: {score:.1f}/100"
+            for name, score in scoring.component_scores.items()
+        ]
+        for component, reason in scoring.excluded_components:
+            try:
+                social_reason = SocialReasonCode(reason) if component == "Social" else None
+            except ValueError:
+                social_reason = None
+            if social_reason is not None:
+                detail = _SOCIAL_REASON_COPY[social_reason]
+            elif component == "Social":
+                detail = "No usable social data was available."
+            else:
+                detail = reason.split(": ", 1)[-1]
+            explanation_lines.append(
+                f"\u2022 {escape_html(component)} component excluded: {escape_html(detail)}"
+            )
+        explanation = "\n".join(explanation_lines)
+        return (
+            f"{score_line}\n{coverage_line}\n\n"
+            f"<b>Why this score:</b>\n{explanation}"
+        )
+
     explanation = "\n".join(f"\u2022 {escape_html(line)}" for line in scoring.explanation)
     return (
         f"AI Score: <b>{scoring.score_ai:.0f}/100</b> \u2014 {escape_html(scoring.tier_label)}\n\n"
@@ -291,21 +347,19 @@ def _social_section(social: SocialResult) -> str:
     docstring for why `follower_growth_pct` is a permanent, not a
     coming-later, gap here).
 
-    `degraded=True` covers both "account lookup failed" and "account
-    resolved to nothing" (Step 13's own `SocialEngine.analyze` contract)
-    — this section doesn't need to distinguish the two itself, same as
-    `_holder_section`/`_momentum_section` don't distinguish their own
-    engines' different degrade causes beyond the one `degraded_reason`
-    string.
+    Structured reason codes distinguish full lookup failures from
+    successfully resolved accounts that returned insufficient data.
 
     `verified_follower_ratio` is shown as a percentage (Part III.4 gives
     it 0.0-1.0; this renderer's own naming convention note applies the
     same *100 display-only conversion `_holder_section` already uses for
     HCI)."""
     if social.degraded:
+        reason = _SOCIAL_REASON_COPY.get(social.reason_code) if social.reason_code is not None else None
+        reason = reason or social.degraded_reason or "Social data could not be retrieved."
         return (
             "\U0001f426 <b>Social Signals</b>\n"
-            f"Unavailable ({escape_html(social.degraded_reason or 'account could not be resolved')})."
+            f"Unavailable ({escape_html(reason)})."
         )
 
     sentiment_word = (
@@ -320,24 +374,38 @@ def _social_section(social: SocialResult) -> str:
         f"Sentiment: {sentiment_word} ({social.sentiment_ratio:+.2f})",
         "Follower Growth: not measurable — twitterapi.io exposes no per-follower join date to diff against",
     ]
+    if social.reason_code is not None:
+        reason = _SOCIAL_REASON_COPY[social.reason_code]
+        lines.insert(1, f"Data status: {escape_html(reason)}")
     return "\n".join(lines)
 
 
-def render_result_list(results: list[ScoredResult], page: int = 0) -> RenderedMessage:
+def render_result_list(
+    results: list[ScoredResult],
+    page: int = 0,
+    summary: dict[str, int] | None = None,
+    source_note: str | None = None,
+    batch_id: str | None = None,
+    heading: str = "Results",
+    empty_message: str | None = None,
+    scope_note: str | None = None,
+    back_callback: str = "nav_scan",
+) -> RenderedMessage:
     """
-    Paginated, 5 per page (Part II.5's site map). In this build, a scan
-    only ever produces one `ScoredResult` (Step 7 wires single-address
-    paste only — Trending/New Listings discovery, which could produce
-    more, isn't wired to any engine yet); pagination is still implemented
-    for real rather than assumed-away, since the signature commits to it
-    and a one-item list is just the page_count==1 case of the same logic.
+    Paginated, 5 per page (Part II.5's site map). Discovery scans may
+    include a screening summary and a feed-specific transparency note;
+    ordinary single-address result lists keep their existing rendering.
     """
     total_pages = max(1, (len(results) + _RESULTS_PER_PAGE - 1) // _RESULTS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     page_items = results[page * _RESULTS_PER_PAGE : (page + 1) * _RESULTS_PER_PAGE]
 
     if not results:
-        body = "No matches for this scan."
+        body = empty_message or (
+            "No tokens passed the current screening criteria."
+            if summary is not None
+            else "No matches for this scan."
+        )
         rows: list[list[InlineKeyboardButton]] = []
     else:
         body = f"{len(results)} result(s):"
@@ -346,7 +414,7 @@ def render_result_list(results: list[ScoredResult], page: int = 0) -> RenderedMe
                 InlineKeyboardButton(
                     text=(
                         f"{escape_html(r.core.primary_pair.base_token_symbol) if r.core.primary_pair else '?'} "
-                        f"\u2014 {r.scoring.score_ai:.0f} ({escape_html(r.scoring.tier_label)})"
+                        f"\u2014 {_score_summary(r.scoring)}"
                     ),
                     callback_data=f"result_view:{r.result_id}",
                 )
@@ -354,20 +422,45 @@ def render_result_list(results: list[ScoredResult], page: int = 0) -> RenderedMe
             for r in page_items
         ]
         if total_pages > 1:
+            if batch_id is None:
+                raise ValueError("batch_id is required for paginated result lists")
             nav_row = []
             if page > 0:
-                nav_row.append(InlineKeyboardButton(text="\u25c0\ufe0f Prev", callback_data=f"result_page:{page - 1}"))
+                nav_row.append(
+                    InlineKeyboardButton(
+                        text="\u25c0\ufe0f Prev",
+                        callback_data=f"result_page:{batch_id}:{page - 1}",
+                    )
+                )
             nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
             if page < total_pages - 1:
-                nav_row.append(InlineKeyboardButton(text="Next \u25b6\ufe0f", callback_data=f"result_page:{page + 1}"))
+                nav_row.append(
+                    InlineKeyboardButton(
+                        text="Next \u25b6\ufe0f",
+                        callback_data=f"result_page:{batch_id}:{page + 1}",
+                    )
+                )
             rows.append(nav_row)
 
-    html = f"\U0001f4cb <b>Results</b>\n\n{escape_html(body)}"
-    rows.extend([_back_home_row("nav_scan")])
+    html = f"\U0001f4cb <b>{escape_html(heading)}</b>\n\n{escape_html(body)}"
+    if summary is not None:
+        html += (
+            "\n\n<b>Discovery screening</b>\n"
+            f"Discovered: {summary['discovered']} \u00b7 "
+            f"Analyzed: {summary['analyzed']} \u00b7 "
+            f"Rejected: {summary['rejected']} \u00b7 "
+            f"Displayed: {summary['displayed']} \u00b7 "
+            f"Scan failures: {summary['failed']}"
+        )
+    if source_note is not None:
+        html += f"\n\n<i>{escape_html(source_note)}</i>"
+    if scope_note is not None:
+        html += f"\n\n<i>{escape_html(scope_note)}</i>"
+    rows.extend([_back_home_row(back_callback)])
     return RenderedMessage(html=html, keyboard=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-def render_result_detail(result: ScoredResult) -> RenderedMessage:
+def render_result_detail(result: ScoredResult, back_callback: str | None = None) -> RenderedMessage:
     """
     Every field Steps 4-6 (Core/Security/Scoring), Step 8 (Holder), and
     Step 9 (Momentum) can actually populate (Part VIII Step 7's
@@ -392,11 +485,18 @@ def render_result_detail(result: ScoredResult) -> RenderedMessage:
     chain_label = escape_html(core.chain.value.upper()) if core.chain is not None else "Unknown Chain"
     address_line = f"<code>{escape_html(core.address)}</code>"
 
-    html = "\n\n".join(
+    sections = [
+        f"\U0001f9e0 <b>AI Intel Report</b>\n\n<b>{name}</b> ({symbol}) \u2014 {chain_label}\n{address_line}",
+        _score_section(scoring),
+    ]
+    if isinstance(scoring, ScoringResult) and result.risk_opportunity is not None:
+        sections.append(
+            _risk_opportunity_matrix_section(
+                result.risk_opportunity, scoring.score_risk, scoring.score_opportunity
+            )
+        )
+    sections.extend(
         [
-            f"\U0001f9e0 <b>AI Intel Report</b>\n\n<b>{name}</b> ({symbol}) \u2014 {chain_label}\n{address_line}",
-            _score_section(scoring),
-            _risk_opportunity_matrix_section(result.risk_opportunity, scoring.score_risk, scoring.score_opportunity),
             _core_section(core),
             _security_section(security),
             _holder_section(holder),
@@ -404,6 +504,7 @@ def render_result_detail(result: ScoredResult) -> RenderedMessage:
             _social_section(social),
         ]
     )
+    html = "\n\n".join(sections)
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -425,7 +526,7 @@ def render_result_detail(result: ScoredResult) -> RenderedMessage:
     )
 
     rows.append([InlineKeyboardButton(text="\U0001f504 Rescan", callback_data=f"scan_rescan:{result.result_id}")])
-    rows.append(_back_home_row(f"result_back_list:{result.result_id}"))
+    rows.append(_back_home_row(back_callback or f"result_back_list:{result.result_id}"))
 
     return RenderedMessage(html=html, keyboard=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -440,9 +541,10 @@ def render_watch_alert(result: ScoredResult) -> RenderedMessage:
     same exception from the sending side). Deliberately short — a full
     scan result already exists at Result Detail, one tap away via the
     same `result_view:{uuid}` callback shape Step 3 established (not a
-    parallel format — Step 12's own Unit Testing Requirement) — this
+    parallel format — Step 12's own Unit Testing Requirement) —     this
     message's only job is to say a match was found and get the person
-    there fast."""
+    there fast. The `watch` callback suffix preserves the alert origin so
+    Result Detail's Back button returns to Auto-Watch."""
     core, scoring = result.core, result.scoring
     if core.primary_pair is not None:
         name = escape_html(core.primary_pair.base_token_name)
@@ -450,13 +552,23 @@ def render_watch_alert(result: ScoredResult) -> RenderedMessage:
     else:
         name, symbol = "Unknown Token", "?"
 
+    risk_line = (
+        f"\n{escape_html(result.risk_opportunity.label)}"
+        if result.risk_opportunity is not None
+        else ""
+    )
     html = (
         "\U0001f6a8 <b>Auto-Watch Match</b>\n\n"
         f"<b>{name}</b> ({symbol})\n"
-        f"AI Score: {scoring.score_ai:.0f}/100 \u2014 {escape_html(scoring.tier_label)}\n"
-        f"{escape_html(result.risk_opportunity.label)}"
+        f"AI Score: {_score_summary(scoring, include_scale=True)}"
+        f"{risk_line}"
     )
-    rows = [[InlineKeyboardButton(text="\U0001f4c4 View Full Report", callback_data=f"result_view:{result.result_id}")]]
+    rows = [[
+        InlineKeyboardButton(
+            text="\U0001f4c4 View Full Report",
+            callback_data=f"result_view:{result.result_id}:watch",
+        )
+    ]]
     return RenderedMessage(html=html, keyboard=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -496,7 +608,7 @@ def render_trade_staging(result: ScoredResult, bot: TradingBot) -> RenderedMessa
         "\U0001f6a6 <b>Trade Staging</b>\n\n"
         f"Target: <b>{symbol}</b> on {chain_label}\n"
         f"Bot: <b>{escape_html(provider.display_name)}</b>\n"
-        f"AI Score: {scoring.score_ai:.0f}/100 \u2014 {escape_html(scoring.tier_label)}\n"
+        f"AI Score: {_score_summary(scoring, include_scale=True)}\n"
         f"{warning_line}\n"
         f"{escape_html(DISCLAIMER)} Approving opens your chosen bot with this token "
         "pre-filled \u2014 nothing executes here."

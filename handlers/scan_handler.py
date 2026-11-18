@@ -16,6 +16,7 @@ with it — see `scan_orchestration.run_scan`'s docstring for why).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -27,7 +28,7 @@ from analysis.security_engine import SecurityEngine
 from analysis.social_engine import SocialEngine
 from bot.constants import Chain, FSMState
 from bot.types import EngineStatus
-from handlers.base import TelegramEvent, reply, send_rendered
+from handlers.base import TelegramEvent, reply, send_new_rendered, send_rendered
 from handlers.callback_parser import parse_address, parse_callback
 from handlers.scan_orchestration import ScoredResult, run_scan
 from rendering.error_renderer import RECOVERY_HOME, render_error
@@ -48,6 +49,7 @@ _INVALID_ADDRESS_MESSAGE = (
     "That doesn't look like a valid contract address. Double-check it and "
     "send it again, or tap Home."
 )
+_SCAN_ALREADY_RUNNING_HTML = "<b>A scan is already running.</b> Please wait for it to finish or cancel it first."
 _SCAN_CANCELLED_HTML = "\u274c <b>Scan cancelled.</b>"
 
 # Callback commands this handler owns. Kept as a set (not a dict of
@@ -84,8 +86,14 @@ class ScanHandler:
         if isinstance(event, CallbackQuery):
             parsed = parse_callback(event.data or "")
             return parsed.command in _OWNED_CALLBACK_COMMANDS
-        if isinstance(event, Message) and ctx.state is FSMState.AWAITING_ADDRESS:
-            return True
+        if isinstance(event, Message):
+            if ctx.state is FSMState.AWAITING_ADDRESS:
+                return True
+            if ctx.state is FSMState.IDLE and parse_address((event.text or "").strip()).is_valid_shape:
+                return True
+            if event.from_user is not None:
+                task = self._session_store.get_scan_task(event.from_user.id)
+                return task is not None and not task.done()
         return False
 
     async def handle(self, event: TelegramEvent, ctx: FSMContext) -> None:
@@ -103,6 +111,8 @@ class ScanHandler:
         parsed = parse_callback(event.data or "")
 
         if parsed.command == "scan_paste":
+            if await self._reject_if_scan_active(event, user_id):
+                return
             self._fsm.transition(user_id, FSMState.AWAITING_ADDRESS)
             await send_rendered(event, render_plain(_PASTE_PROMPT_HTML, back_callback="nav_scan"))
             return
@@ -112,11 +122,11 @@ class ScanHandler:
             return
 
         if parsed.command == "result_back_list":
-            await self._show_result_list(event, user_id, parsed.params)
+            await self._show_result_back_list(event, user_id, parsed.params)
             return
 
         if parsed.command == "result_page":
-            await self._show_result_list(event, user_id, parsed.params)
+            await self._show_result_page(event, user_id, parsed.params)
             return
 
         if parsed.command == "scan_rescan":
@@ -124,28 +134,28 @@ class ScanHandler:
             return
 
         if parsed.command == "scan_cancel":
-            # STEP 16 FIX: the ONLY button on the Scanning/Progress screen
-            # (Playbook Part II.9's Back/Home target for this screen is
-            # "Cancel only") had no handler anywhere - it fell through to
-            # UnknownInputHandler's "that menu has expired" error, which
-            # is both wrong (nothing expired, the user just cancelled)
-            # and inconsistent with every other cancel/abort path in this
-            # codebase (Trade Staging's Abort gets its own honest
-            # confirmation, not a fake error). Matches the FSM's own
-            # documented SCANNING -> IDLE edge ("user cancelled").
-            #
-            # KNOWN LIMITATION, left alone rather than silently "fixed" by
-            # inventing new architecture (Part VIII Step 16's own
-            # constraint: no new features/architecture in this step):
-            # `_run_full_scan` below is one continuous awaited call with
-            # no cancellation token, so an already-in-flight scan keeps
-            # running in the background and will still edit this same
-            # message with a real result once it finishes, regardless of
-            # this tap. This handler makes the user's own FSM state and
-            # immediate feedback correct and honest; it does not stop
-            # in-flight engine calls - that would need a real
-            # cancellation-token mechanism, which is out of this step's
-            # scope. Flagged here rather than hidden.
+            task = self._session_store.get_scan_task(user_id)
+            source = self._session_store.get_scan_task_source(user_id)
+            if task is not None and not task.done() and source == "auto_watch":
+                await send_rendered(
+                    event,
+                    render_plain(
+                        "This scan is part of Auto-Watch and was not cancelled.",
+                        back_callback="nav_scan",
+                    ),
+                )
+                return
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Scan task failed while being cancelled", extra={"user_id": user_id})
+            task = self._session_store.get_scan_task(user_id)
+            if task is not None and task.done():
+                self._session_store.pop_scan_task(user_id)
             self._fsm.transition(user_id, FSMState.IDLE)
             await send_rendered(event, render_plain(_SCAN_CANCELLED_HTML, back_callback="nav_scan"))
             return
@@ -156,30 +166,93 @@ class ScanHandler:
             await self._stale_result(event)
             return
         self._fsm.transition(user_id, FSMState.RESULT_DETAIL)
-        await send_rendered(event, render_result_detail(scored))
+        back_callback = "nav_watch" if len(params) > 1 and params[1] == "watch" else None
+        await send_new_rendered(event, render_result_detail(scored, back_callback=back_callback))
 
-    async def _show_result_list(self, event: CallbackQuery, user_id: int, params: list[str]) -> None:
-        """
-        Handles both `result_back_list:{id}` (Result Detail's Back
-        button) and `result_page:{n}` (pagination). In this build a scan
-        only ever caches one result, so "the list" is reconstructed from
-        that single cached item either way — see
-        `rendering/result_renderer.py`'s docstring on why real
-        multi-result pagination logic still exists even though nothing
-        in this step's own flow produces more than one item.
-        """
+    async def _show_result_back_list(self, event: CallbackQuery, user_id: int, params: list[str]) -> None:
+        """Return from a result detail to the list and page it came from."""
         scored = self._lookup_result(params)
         if scored is None:
             await self._stale_result(event)
             return
-        self._fsm.transition(user_id, FSMState.RESULT_READY)
-        # result_page:{n} carries a page index; result_back_list:{id}
-        # carries a result_id - only try to parse a page number, default
-        # to page 0 (the only page that exists for a one-item list).
-        page = 0
-        if params and params[0].isdigit():
-            page = int(params[0])
-        await send_rendered(event, render_result_list([scored], page=page))
+        ctx = self._fsm.get_state(user_id)
+        batch_id = ctx.payload.get("result_list_batch_id")
+        page = ctx.payload.get("result_list_page", 0)
+        if isinstance(batch_id, str) and isinstance(page, int):
+            await self._show_result_page(event, user_id, [batch_id, str(page)])
+            return
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=None,
+            result_list_page=0,
+        )
+        await send_rendered(event, render_result_list([scored]))
+
+    async def _show_result_page(self, event: CallbackQuery, user_id: int, params: list[str]) -> None:
+        """Render a page from a cached batch without rescanning candidates."""
+        if len(params) != 2 or not params[0] or not params[1].isdigit():
+            await self._stale_result(event)
+            return
+
+        batch_id, page_text = params
+        batch = self._session_store.cache_get_batch(batch_id)
+        if batch is None:
+            await self._stale_result(event)
+            return
+
+        result_ids, meta = batch
+        results: list[ScoredResult] = []
+        for result_id in result_ids:
+            cached = self._session_store.cache_get(result_id)
+            if not isinstance(cached, ScoredResult):
+                await self._stale_result(event)
+                return
+            results.append(cached)
+
+        summary_keys = ("discovered", "analyzed", "rejected", "displayed", "failed")
+        summary_values = {key: meta.get(key) for key in summary_keys}
+        summary = (
+            {key: value for key, value in summary_values.items() if isinstance(value, int)}
+            if all(isinstance(value, int) for value in summary_values.values())
+            else None
+        )
+        source_note = meta.get("source_note")
+        if not isinstance(source_note, str):
+            source_note = None
+        heading = meta.get("heading")
+        if not isinstance(heading, str):
+            heading = "Results"
+        empty_message = meta.get("empty_message")
+        if not isinstance(empty_message, str):
+            empty_message = None
+        scope_note = meta.get("scope_note")
+        if not isinstance(scope_note, str):
+            scope_note = None
+        back_callback = meta.get("back_callback")
+        if not isinstance(back_callback, str):
+            back_callback = "nav_scan"
+
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=batch_id,
+            result_list_page=int(page_text),
+        )
+        await send_rendered(
+            event,
+            render_result_list(
+                results,
+                page=int(page_text),
+                summary=summary,
+                source_note=source_note,
+                batch_id=batch_id,
+                heading=heading,
+                empty_message=empty_message,
+                scope_note=scope_note,
+                back_callback=back_callback,
+            ),
+        )
 
     async def _rescan(self, event: CallbackQuery, user_id: int, params: list[str]) -> None:
         previous = self._lookup_result(params)
@@ -210,7 +283,7 @@ class ScanHandler:
             event,
             render_error(
                 "That result has expired.",
-                technical_detail="Cached ScoredResult not found for this uuid (process restart, or an unknown key).",
+                technical_detail="Cached ScoredResult or result batch not found (process restart, or an unknown key).",
                 show_technical=show_technical,
                 recovery_action=RECOVERY_HOME,
             ),
@@ -221,6 +294,8 @@ class ScanHandler:
     async def _handle_pasted_address(self, event: Message, ctx: FSMContext) -> None:
         assert event.from_user is not None
         user_id = event.from_user.id
+        if await self._reject_if_scan_active(event, user_id):
+            return
         parsed_address = parse_address((event.text or "").strip())
 
         if not parsed_address.is_valid_shape:
@@ -255,6 +330,8 @@ class ScanHandler:
         against this address and show the result," differing only in how
         they got the address.
         """
+        if await self._reject_if_scan_active(event, user_id):
+            return
         self._fsm.transition(user_id, FSMState.SCANNING)
 
         # Mutable progress snapshot, updated by whichever hook fires and
@@ -312,8 +389,8 @@ class ScanHandler:
             progress_state["momentum"] = EngineStatus.DONE
             await _update_progress()
 
-        try:
-            scored = await run_scan(
+        scan_task = asyncio.create_task(
+            run_scan(
                 address,
                 self._core_engine,
                 self._security_engine,
@@ -328,7 +405,15 @@ class ScanHandler:
                 on_holder_complete=on_holder_complete,
                 on_social_complete=on_social_complete,
                 on_momentum_complete=on_momentum_complete,
+                user_id=user_id,
             )
+        )
+        self._session_store.set_scan_task(user_id, scan_task)
+        try:
+            scored = await scan_task
+        except asyncio.CancelledError:
+            self._fsm.transition(user_id, FSMState.IDLE)
+            return
         except Exception:
             logger.exception("Unexpected failure during scan", extra={"address": address, "user_id": user_id})
             self._fsm.transition(user_id, FSMState.IDLE)
@@ -338,10 +423,27 @@ class ScanHandler:
                     parse_mode="HTML",
                 )
             return
+        finally:
+            if self._session_store.get_scan_task(user_id) is scan_task:
+                self._session_store.pop_scan_task(user_id)
 
-        self._fsm.transition(user_id, FSMState.RESULT_READY)
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=None,
+            result_list_page=0,
+        )
         final = render_result_list([scored])
         if progress_message is not None:
             await progress_message.edit_text(final.html, parse_mode="HTML", reply_markup=final.keyboard)
         else:
             await reply(event, final.html, keyboard=final.keyboard)
+
+    async def _reject_if_scan_active(self, event: TelegramEvent, user_id: int) -> bool:
+        task = self._session_store.get_scan_task(user_id)
+        if task is not None and not task.done():
+            await send_rendered(event, render_plain(_SCAN_ALREADY_RUNNING_HTML, back_callback="nav_scan"))
+            return True
+        if task is not None:
+            self._session_store.pop_scan_task(user_id)
+        return False

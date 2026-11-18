@@ -11,13 +11,15 @@ new formula term per new engine" plugin principle, implemented as real
 dispatch logic rather than asserted in prose (Part VII.1) — this pass is
 that dispatch logic's THIRD and final branch landing, exactly as Step
 6's own docstring said it eventually would, and Step 10's docstring said
-the pattern would repeat once more to get here.
+the pattern would repeat once more to get here. The explicitly selected
+experimental v4 path is additive; omitting its `version` selector keeps
+the v1/v2/v3 dispatch and production default.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, overload
 
 from analysis.core_engine import CoreResult
 from analysis.holder_engine import HolderResult
@@ -30,8 +32,12 @@ from scoring.formulas import (
     score_opportunity_v1,
     score_opportunity_v2,
     score_opportunity_v3,
+    score_core_market_v4,
+    score_momentum_v4,
     score_risk_v1,
     score_risk_v2,
+    score_security_v4,
+    score_social_v4,
     tier_label,
 )
 
@@ -51,11 +57,54 @@ class ScoringResult:
     pipeline_version: Literal["v1", "v2", "v3"] = "v1"
 
 
+@dataclass
+class ScoringResultV4:
+    """Experimental component-score result. It intentionally has no separate
+    Risk or Opportunity axis and no calibrated tier until RM-12."""
+
+    total_score: float | None
+    coverage_pct: float
+    component_scores: dict[str, float] = field(default_factory=dict)
+    included_components: list[str] = field(default_factory=list)
+    excluded_components: list[tuple[str, str]] = field(default_factory=list)
+    tier_label: str = "Insufficient Data"
+    explanation: list[str] = field(default_factory=list)
+    pipeline_version: Literal["v4"] = "v4"
+
+    @property
+    def score_confidence(self) -> float:
+        return self.coverage_pct
+
+
 class ScoringPipeline:
     """No black-box model (Step 6's constraint): every number this class
     returns traces back to a named function in `formulas.py`, and
     `explanation` is generated from the specific inputs that actually
     fired, never a static template with items filled in or crossed out."""
+
+    @overload
+    def score(
+        self,
+        core: CoreResult,
+        security: SecurityResult,
+        holder: HolderResult | None = None,
+        momentum: MomentumResult | None = None,
+        social: SocialResult | None = None,
+        *,
+        version: Literal["v4"],
+    ) -> ScoringResultV4: ...
+
+    @overload
+    def score(
+        self,
+        core: CoreResult,
+        security: SecurityResult,
+        holder: HolderResult | None = None,
+        momentum: MomentumResult | None = None,
+        social: SocialResult | None = None,
+        *,
+        version: None = None,
+    ) -> ScoringResult: ...
 
     def score(
         self,
@@ -64,7 +113,9 @@ class ScoringPipeline:
         holder: HolderResult | None = None,
         momentum: MomentumResult | None = None,
         social: SocialResult | None = None,
-    ) -> ScoringResult:
+        *,
+        version: Literal["v4"] | None = None,
+    ) -> ScoringResult | ScoringResultV4:
         """
         Dispatches on which optional engine outputs are present. v3 is
         implemented as of this pass (Step 14) — `social` is narrowed from
@@ -82,6 +133,8 @@ class ScoringPipeline:
         deep inside a formula function), same reasoning `_score_v2`'s own
         holder+momentum check already established.
         """
+        if version == "v4":
+            return self._score_v4(core, security, holder, momentum, social)
         if social is not None:
             if holder is None or momentum is None:
                 raise ValueError(
@@ -98,6 +151,91 @@ class ScoringPipeline:
                 "score_opportunity_v2 needs momentum) - got only one."
             )
         return self._score_v1(core, security)
+
+    @staticmethod
+    def _score_v4(
+        core: CoreResult,
+        security: SecurityResult,
+        holder: HolderResult | None,
+        momentum: MomentumResult | None,
+        social: SocialResult | None,
+    ) -> ScoringResultV4:
+        components: dict[str, float] = {}
+        excluded: list[tuple[str, str]] = []
+
+        core_score = score_core_market_v4(core)
+        if core_score is not None:
+            components["Core/Market"] = core_score
+        elif core.degraded:
+            excluded.append(("Core/Market", f"CORE_DEGRADED: {core.degraded_reason or 'Core data unavailable.'}"))
+        elif core.primary_pair is None:
+            excluded.append(("Core/Market", "CORE_PAIR_UNAVAILABLE: No primary market pair was resolved."))
+        elif core.dilution_ratio is None:
+            excluded.append(("Core/Market", "CORE_DILUTION_UNAVAILABLE: Market-cap-to-FDV ratio is unavailable."))
+        else:
+            excluded.append(("Core/Market", "CORE_MARKET_INPUT_INVALID: Market inputs were not finite numbers."))
+
+        if security.degraded:
+            excluded.append(("Security", f"SECURITY_DEGRADED: {security.degraded_reason or 'Security data unavailable.'}"))
+        elif holder is None:
+            excluded.append(("Security", "HOLDER_NOT_PROVIDED: Holder safety data was not supplied."))
+        elif holder.degraded:
+            excluded.append(("Security", f"HOLDER_DEGRADED: {holder.degraded_reason or 'Holder safety data unavailable.'}"))
+        else:
+            security_score = score_security_v4(security, holder)
+            if security_score is None:
+                excluded.append(("Security", "SECURITY_INPUT_INVALID: Security inputs were unavailable."))
+            else:
+                components["Security"] = security_score
+
+        if core.degraded:
+            excluded.append(("Momentum", f"CORE_DEGRADED: {core.degraded_reason or 'Core data unavailable.'}"))
+        elif holder is None:
+            excluded.append(("Momentum", "HOLDER_NOT_PROVIDED: Holder-growth data was not supplied."))
+        elif holder.degraded:
+            excluded.append(("Momentum", f"HOLDER_DEGRADED: {holder.degraded_reason or 'Holder-growth data unavailable.'}"))
+        elif momentum is None:
+            excluded.append(("Momentum", "MOMENTUM_NOT_PROVIDED: Momentum data was not supplied."))
+        elif momentum.degraded:
+            excluded.append(("Momentum", "MOMENTUM_DEGRADED: Momentum inputs were degraded."))
+        else:
+            momentum_score = score_momentum_v4(momentum, holder)
+            if momentum_score is None:
+                excluded.append(("Momentum", "MOMENTUM_INPUT_INVALID: Momentum inputs were not finite numbers."))
+            else:
+                components["Momentum"] = momentum_score
+
+        if social is None:
+            excluded.append(("Social", "SOCIAL_NOT_PROVIDED: Social data was not supplied."))
+        elif social.degraded or social.reason_code is not None:
+            reason = social.reason_code.value if social.reason_code is not None else (
+                social.degraded_reason or "SOCIAL_DATA_UNAVAILABLE"
+            )
+            excluded.append(("Social", reason))
+        else:
+            social_score = score_social_v4(social)
+            if social_score is None:
+                excluded.append(("Social", "SOCIAL_INPUT_INVALID: Social inputs were not finite numbers."))
+            else:
+                components["Social"] = social_score
+
+        included = list(components)
+        total = sum(components.values()) / len(components) if components else None
+        coverage = len(included) / 4.0 * 100.0
+        explanation = [f"{name} component score: {score:.1f}/100." for name, score in components.items()]
+        explanation.extend(f"{name} component excluded: {reason}" for name, reason in excluded)
+        explanation.append(f"Coverage: {coverage:.0f}% ({len(included)} of 4 components).")
+        explanation.append("Experimental v4 has no calibrated tier or Risk/Opportunity axes.")
+
+        return ScoringResultV4(
+            total_score=total,
+            coverage_pct=coverage,
+            component_scores=components,
+            included_components=included,
+            excluded_components=excluded,
+            tier_label="Uncalibrated v4" if total is not None else "Insufficient Data",
+            explanation=explanation,
+        )
 
     def _score_v1(self, core: CoreResult, security: SecurityResult) -> ScoringResult:
         opportunity = score_opportunity_v1(core)

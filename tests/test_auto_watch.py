@@ -70,6 +70,7 @@ from analysis.security_engine import SecurityEngine
 from analysis.social_engine import SocialEngine
 from bot.constants import Chain
 from handlers.auto_watch import AutoWatchManager
+from handlers.scan_orchestration import ScoredResult
 from scoring.pipeline import ScoringPipeline
 from state.session_store import SessionStore
 
@@ -229,11 +230,51 @@ async def test_full_watch_cycle_start_nonmatch_match_alert_stop() -> None:
     await manager.stop(user_id=1)
 
     assert alerts == [(1, matching_address)]  # exactly the matching one, exactly once
+    history = session_store.get_user_history(1)
+    assert len(history) == 1
+    matched_result = session_store.cache_get(history[0])
+    assert isinstance(matched_result, ScoredResult)
+    assert matched_result.core.address == matching_address
 
     # No orphaned task: the registry has nothing left for this user, and
     # the task object itself is fully finished, not just "cancel requested".
     assert session_store.get_watch_task(1) is None
     assert manager.status(1) is None
+
+
+@pytest.mark.asyncio
+async def test_auto_watch_matched_result_index_is_bounded() -> None:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    addresses = [f"{'A' * 31}{suffix}" for suffix in alphabet[:51]]
+    candidates = [
+        DiscoveryCandidate(chain=Chain.SOL, token_address=address, source="new_listings")
+        for address in addresses
+    ]
+    pairs_by_address = {
+        address: [_pair(address, liquidity_usd=200_000.0, market_cap=1_000_000.0, pool_age_days=10.0)]
+        for address in addresses
+    }
+    discovery = _FakeDiscoveryProvider(candidates=candidates)
+    session_store = SessionStore()
+    all_matches_found = asyncio.Event()
+    match_count = 0
+
+    async def on_match(user_id: int, scored) -> None:
+        nonlocal match_count
+        match_count += 1
+        if match_count == len(candidates):
+            all_matches_found.set()
+
+    manager = _make_manager(pairs_by_address, discovery, on_match, session_store)
+    await manager.start(user_id=51, profile=CONSERVATIVE, interval_min=1)
+    await asyncio.wait_for(all_matches_found.wait(), timeout=5.0)
+
+    status = manager.status(51)
+    assert status is not None
+    assert status.matches_found == 51
+    assert len(status.matched_result_ids) == 50
+    assert len(session_store.get_user_history(51)) == 50
+    await manager.stop(user_id=51)
 
 
 @pytest.mark.asyncio

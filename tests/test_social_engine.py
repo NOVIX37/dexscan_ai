@@ -20,7 +20,12 @@ import pathlib
 
 import pytest
 
-from analysis.api_abstraction import Tweet, XUserProfile
+from analysis.api_abstraction import (
+    SocialProviderError,
+    SocialReasonCode,
+    Tweet,
+    XUserProfile,
+)
 from analysis.providers.twitterapi_io_parser import (
     parse_followers,
     parse_mentions,
@@ -62,6 +67,7 @@ class _FakeSocialProvider:
         lookup_raises: bool = False,
         followers_raises: bool = False,
         mentions_raises: bool = False,
+        lookup_error: Exception | None = None,
     ) -> None:
         self._profile = profile
         self._followers = followers if followers is not None else []
@@ -69,8 +75,11 @@ class _FakeSocialProvider:
         self._lookup_raises = lookup_raises
         self._followers_raises = followers_raises
         self._mentions_raises = mentions_raises
+        self._lookup_error = lookup_error
 
     async def lookup_user(self, handle: str) -> XUserProfile:
+        if self._lookup_error is not None:
+            raise self._lookup_error
         if self._lookup_raises:
             raise RuntimeError("simulated transport failure")
         return self._profile
@@ -163,6 +172,7 @@ async def test_provider_outage_on_primary_lookup_degrades_fully() -> None:
     result = await SocialEngine(provider).analyze("SolanaFoundation")
 
     assert result.degraded is True
+    assert result.reason_code is SocialReasonCode.TRANSPORT_ERROR
     assert result.degraded_reason is not None
     assert result.x_score == 0
     assert result.sentiment_ratio == 0.0
@@ -186,6 +196,7 @@ async def test_account_not_found_degrades_with_specific_reason() -> None:
     result = await SocialEngine(provider).analyze("ghost_handle")
 
     assert result.degraded is True
+    assert result.reason_code is SocialReasonCode.ACCOUNT_NOT_FOUND
     assert "ghost_handle" in (result.degraded_reason or "")
     assert "provider" not in (result.degraded_reason or "").lower()  # distinct from the transport-failure message
 
@@ -234,12 +245,44 @@ async def test_influencer_mention_counted_by_verification_or_follower_threshold(
 
 @pytest.mark.asyncio
 async def test_empty_follower_sample_gives_neutral_ratio_not_an_error() -> None:
-    """A separate divide-by-zero guard from the mentions ones above -
-    zero followers sampled (a brand-new account) must not raise."""
+    """A zero follower sample and zero mentions is insufficient data,
+    not a divide-by-zero or provider failure."""
     provider = _FakeSocialProvider(profile=_user("user_info_moderate.json"), followers=_followers("followers_empty.json"))
     result = await SocialEngine(provider).analyze("SampleMemeCoin")
     assert result.verified_follower_ratio == 0.0
     assert result.degraded is False  # empty sample isn't a failure, just a real "nothing to sample yet"
+    assert result.reason_code is SocialReasonCode.INSUFFICIENT_DATA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exception", "expected_code"),
+    [
+        (
+            SocialProviderError(SocialReasonCode.NO_API_KEY, "not configured"),
+            SocialReasonCode.NO_API_KEY,
+        ),
+        (
+            SocialProviderError(SocialReasonCode.RATE_LIMITED, "rate limited"),
+            SocialReasonCode.RATE_LIMITED,
+        ),
+        (TimeoutError("simulated timeout"), SocialReasonCode.PROVIDER_TIMEOUT),
+        (RuntimeError("simulated transport failure"), SocialReasonCode.TRANSPORT_ERROR),
+    ],
+)
+async def test_lookup_failures_retain_structured_reason_codes(
+    exception: Exception,
+    expected_code: SocialReasonCode,
+) -> None:
+    provider = _FakeSocialProvider(
+        profile=_user("user_info_elite.json"),
+        lookup_error=exception,
+    )
+
+    result = await SocialEngine(provider).analyze("SampleMemeCoin")
+
+    assert result.degraded is True
+    assert result.reason_code is expected_code
 
 
 @pytest.mark.asyncio
@@ -259,6 +302,7 @@ async def test_secondary_call_failure_degrades_only_its_own_fields() -> None:
     assert result.verified_follower_ratio == 0.0  # this one field falls back
     assert result.x_score > 0  # unaffected - came from the successful lookup_user call
     assert result.sentiment_ratio > 0.0  # unaffected - came from the successful search_mentions call
+    assert result.reason_code is SocialReasonCode.TRANSPORT_ERROR
 
 
 @pytest.mark.asyncio
@@ -272,6 +316,7 @@ async def test_mention_search_failure_degrades_only_its_own_fields() -> None:
     result = await SocialEngine(provider).analyze("SolanaFoundation")
 
     assert result.degraded is False
+    assert result.reason_code is SocialReasonCode.TRANSPORT_ERROR
     assert result.sentiment_ratio == 0.0
     assert result.tweet_frequency_per_day == 0.0
     assert result.influencer_mention_count == 0

@@ -28,7 +28,7 @@ import time
 
 import aiohttp
 
-from analysis.api_abstraction import Tweet, XUserProfile
+from analysis.api_abstraction import SocialProviderError, SocialReasonCode, Tweet, XUserProfile
 from analysis.providers.twitterapi_io_parser import (
     parse_followers,
     parse_mentions,
@@ -68,10 +68,10 @@ class TwitterApiIoProvider:
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self._api_key}
 
-    async def _get(self, path: str, params: dict[str, str]) -> dict:
+    async def _get(self, path: str, params: dict[str, str]) -> dict[str, object]:
         """Shared GET-and-decode for all three endpoints below — same
         error contract as `DexScreenerProvider.get_pairs`: raises
-        `RuntimeError` once every retry is exhausted, never swallows a
+        `SocialProviderError` once every retry is exhausted, never swallows a
         real transport failure into an empty/default result. A non-200
         here always means "the request itself failed" (auth, rate limit,
         malformed query) — twitterapi.io reports "handle not found" as a
@@ -89,15 +89,24 @@ class TwitterApiIoProvider:
         just ~3s slower, while a transient 429 or 5xx — which retrying
         can genuinely fix — gets the chance to. Same tradeoff
         rugcheck.py's own provider already made for the same reason."""
+        if not self._api_key.strip():
+            raise SocialProviderError(
+                SocialReasonCode.NO_API_KEY,
+                "twitterapi.io API key is not configured.",
+            )
+
         url = f"{self._base_url}{path}"
         last_exc: Exception | None = None
+        last_status: int | None = None
         for attempt in range(_MAX_RETRY_ATTEMPTS):
+            last_status = None
             try:
                 async with self._session.get(
                     url, headers=self._headers(), params=params,
                     timeout=aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SECONDS),
                 ) as response:
                     if response.status != 200:
+                        last_status = response.status
                         body_preview = (await response.text())[:200]
                         raise RuntimeError(f"twitterapi.io returned HTTP {response.status}: {body_preview}")
                     return await response.json()  # type: ignore[no-any-return]
@@ -118,8 +127,15 @@ class TwitterApiIoProvider:
                 )
                 await asyncio.sleep(backoff_seconds)
 
-        raise RuntimeError(
-            f"twitterapi.io request failed after {_MAX_RETRY_ATTEMPTS} attempts: {last_exc}"
+        if last_status == 429:
+            reason_code = SocialReasonCode.RATE_LIMITED
+        elif isinstance(last_exc, (asyncio.TimeoutError, aiohttp.ServerTimeoutError)):
+            reason_code = SocialReasonCode.PROVIDER_TIMEOUT
+        else:
+            reason_code = SocialReasonCode.TRANSPORT_ERROR
+        raise SocialProviderError(
+            reason_code,
+            f"twitterapi.io request failed after {_MAX_RETRY_ATTEMPTS} attempts: {last_exc}",
         ) from last_exc
 
     async def lookup_user(self, handle: str) -> XUserProfile:

@@ -18,6 +18,7 @@ specific screen" once the target is explicit rather than generic.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from aiogram.types import CallbackQuery, Message
@@ -25,6 +26,7 @@ from aiogram.types import CallbackQuery, Message
 from bot.constants import FSMState
 from handlers.base import Handler, TelegramEvent, send_rendered
 from handlers.callback_parser import parse_callback
+from handlers.scan_orchestration import ScoredResult
 from rendering.error_renderer import RECOVERY_HOME, render_error
 from rendering.menus import (
     RenderedMessage,
@@ -38,6 +40,7 @@ from rendering.menus import (
 from state.fsm import FSMContext, FSMEngine
 from state.session_store import SessionStore
 
+logger = logging.getLogger(__name__)
 _STALE_SESSION_ERROR = "That menu has expired."
 
 # Every screen reachable via a plain "jump there" callback (Part II.5's
@@ -51,16 +54,15 @@ _STALE_SESSION_ERROR = "That menu has expired."
 # `handlers.help_handler.HelpHandler` in Step 15, for the identical
 # reason: both need real per-user state (`UserSettings`, the FAQ
 # accordion's own sub-navigation) this table has no way to supply.
-# `nav_about` stays here — About has no per-user state at all. Screens
-# with live-data prerequisites (Result List/Detail, Trade Staging,
-# Scanning) are deliberately absent — their own steps add real entry
-# points; nothing here should pre-empt that.
+# `nav_about` stays here — About has no per-user state at all.
+# `nav_recent` is handled by `RecentResultsHandler` because it reads the
+# user's live session history. Screens with other live-data prerequisites
+# (Result List/Detail, Trade Staging, Scanning) are likewise absent.
 _NAV_TARGETS: dict[str, Callable[[FSMContext], RenderedMessage]] = {
     "nav_welcome": lambda ctx: render_welcome(),
     "nav_main": lambda ctx: render_main_menu(ctx),
     "nav_scan": lambda ctx: render_scan_menu(),
     "nav_custom_filter": lambda ctx: render_filter_config(),
-    "nav_recent": lambda ctx: render_recent_results(),
     "nav_about": lambda ctx: render_about(),
 }
 
@@ -145,6 +147,51 @@ class NoopHandler:
         return  # Dispatcher already answered the callback (Part II.8); nothing else to do.
 
 
+class RecentResultsHandler:
+    """Render a user's bounded, current-process scan history."""
+
+    def __init__(self, fsm: FSMEngine, session_store: SessionStore) -> None:
+        self._fsm = fsm
+        self._session_store = session_store
+
+    async def can_handle(self, event: TelegramEvent, ctx: FSMContext) -> bool:
+        return isinstance(event, CallbackQuery) and parse_callback(event.data or "").command == "nav_recent"
+
+    async def handle(self, event: TelegramEvent, ctx: FSMContext) -> None:
+        assert isinstance(event, CallbackQuery) and event.from_user is not None
+        user_id = event.from_user.id
+        results: list[ScoredResult] = []
+        for result_id in self._session_store.get_user_history(user_id):
+            cached = self._session_store.cache_get(result_id)
+            if isinstance(cached, ScoredResult):
+                results.append(cached)
+            else:
+                logger.warning(
+                    "Session history entry has no cached scan result",
+                    extra={"user_id": user_id, "result_id": result_id},
+                )
+
+        batch_id = None
+        if results:
+            batch_id = self._session_store.cache_put_batch(
+                user_id,
+                [result.result_id for result in results],
+                {
+                    "heading": "Recent Results & Stats",
+                    "empty_message": "No scans yet this session.",
+                    "scope_note": "This session only; clears when the bot restarts.",
+                    "back_callback": "nav_main",
+                },
+            )
+        self._fsm.transition(
+            user_id,
+            FSMState.RESULT_READY,
+            result_list_batch_id=batch_id,
+            result_list_page=0,
+        )
+        await send_rendered(event, render_recent_results(results, batch_id=batch_id))
+
+
 class UnknownInputHandler:
     """
     Catch-all — MUST be registered last. Matches anything no other handler
@@ -200,12 +247,11 @@ def build_navigation_handlers(
     `Dispatcher._handlers` directly, which would both break encapsulation
     and duplicate the "catch-all must be last" rule in a second place.
 
-    `session_store` (Step 15 addition) is threaded through to
-    `UnknownInputHandler` alone, for its stale-session error screen's
-    `show_technical_errors` check — every other handler here still needs
-    none of this file's own state.
+    `session_store` supplies both `RecentResultsHandler`'s per-user cache
+    reads and `UnknownInputHandler`'s technical-error setting.
     """
     handlers: list[Handler] = [StartHandler(fsm), MenuNavigationHandler(fsm), NoopHandler()]
     handlers.extend(extra_handlers or [])
+    handlers.append(RecentResultsHandler(fsm, session_store))
     handlers.append(UnknownInputHandler(fsm, session_store))
     return handlers

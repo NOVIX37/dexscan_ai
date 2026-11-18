@@ -2,7 +2,7 @@
 Layer: Scoring — formulas (Playbook Part III.6; Part VIII Step 6; v2
 added in Step 10 [custom roadmap: Step 12]; v3 added in Step 14).
 
-READ PART VII.1 BEFORE TOUCHING THIS FILE. The AI Scoring Pipeline was
+READ PART VII.1 BEFORE TOUCHING THIS FILE. The original AI Scoring Pipeline was
 staged across three versions specifically because `Score_Opportunity`'s
 `SentimentScore` term couldn't feed scoring until Social Engine's wiring
 existed — building the full formula before every input existed would
@@ -11,6 +11,8 @@ with a literal gap in it. Every `_v1`/`_v2`-suffixed function here is a
 deliberately staged slice of Part III.6's final formula, not a different
 formula; `score_opportunity_v3` (this pass) is that formula's final,
 unabridged form — the staging is now complete, not still in progress.
+The experimental v4 component formulas below are additive and do not
+replace or alter any v1/v2/v3 formula.
 
 No black-box model anywhere in this file (Step 6's explicit constraint):
 every term is a named, independently testable function, and every one of
@@ -342,6 +344,87 @@ def score_ai(score_opportunity: float, score_confidence: float, score_risk: floa
         clamp(0,100, (0.70*Score_Opportunity + 0.30*Score_Confidence) - Score_Risk)
     """
     return _clamp((0.70 * score_opportunity + 0.30 * score_confidence) - score_risk)
+
+
+def _log_market_score(value: float) -> float | None:
+    """Map a measured market level onto the RM-10 contract's fixed log scale:
+    $10K -> 0, $10M -> 100, with values outside that interval clamped."""
+    if not math.isfinite(value):
+        return None
+    if value <= 10_000.0:
+        return 0.0
+    if value >= 10_000_000.0:
+        return 100.0
+    return ((math.log10(value) - 4.0) / 3.0) * 100.0
+
+
+def score_core_market_v4(core: CoreResult) -> float | None:
+    """RM-10 Core/Market component: current liquidity, activity level, and
+    market-cap-to-FDV ratio. Price movement and buy pressure belong to
+    Momentum, not this component. A missing pair or dilution ratio excludes
+    the whole component rather than substituting a neutral value."""
+    if core.degraded or core.primary_pair is None or core.dilution_ratio is None:
+        return None
+    if not math.isfinite(core.dilution_ratio):
+        return None
+
+    liquidity_score = _log_market_score(core.liquidity_usd)
+    volume_score = _log_market_score(core.volume_24h)
+    if liquidity_score is None or volume_score is None:
+        return None
+    dilution_score = _clamp(core.dilution_ratio * 100.0)
+    return (liquidity_score + volume_score + dilution_score) / 3.0
+
+
+def score_security_v4(security: SecurityResult, holder: HolderResult) -> float | None:
+    """RM-11 Security component: use the weakest normalized safety signal
+    across trust, holder concentration, and vulnerability evidence."""
+    if security.degraded or holder.degraded:
+        return None
+    if not math.isfinite(security.trust_score) or not math.isfinite(security.sell_tax_pct):
+        return None
+    if not math.isfinite(holder.hci_pct):
+        return None
+    return min(
+        _clamp(security.trust_score),
+        100.0 - _clamp(holder.hci_pct),
+        100.0 - vulnerability_penalty(security),
+    )
+
+
+def _signed_signal_score(value: float) -> float | None:
+    if not math.isfinite(value):
+        return None
+    return (_clamp(value, -100.0, 100.0) + 100.0) / 2.0
+
+
+def score_momentum_v4(momentum: MomentumResult, holder: HolderResult) -> float | None:
+    """RM-10 Momentum component: price acceleration, buy pressure, and holder
+    growth. Do not reuse trending_score, which includes Social momentum, or
+    the current constant-zero historical-growth fields."""
+    if momentum.degraded or holder.degraded:
+        return None
+    price_score = _signed_signal_score(momentum.price_momentum)
+    buy_score = _signed_signal_score(momentum.buy_momentum)
+    if price_score is None or buy_score is None or not math.isfinite(holder.holder_growth_24h_pct):
+        return None
+    holder_growth_score = _clamp(holder.holder_growth_24h_pct)
+    return (price_score + buy_score + holder_growth_score) / 3.0
+
+
+def score_social_v4(social: SocialResult) -> float | None:
+    """RM-10 Social component. The component is unavailable on degraded or
+    reason-coded results; no neutral midpoint is substituted for missing
+    evidence."""
+    if social.degraded or social.reason_code is not None:
+        return None
+    if not math.isfinite(social.verified_follower_ratio) or not math.isfinite(social.sentiment_ratio):
+        return None
+    x_score = _clamp(float(social.x_score))
+    verified_follower_score = _clamp(social.verified_follower_ratio * 100.0)
+    sentiment = max(-1.0, min(1.0, social.sentiment_ratio))
+    sentiment_component = (sentiment + 1.0) * 50.0
+    return (x_score + verified_follower_score + sentiment_component) / 3.0
 
 
 def tier_label(ai_score: float) -> str:

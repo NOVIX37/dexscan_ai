@@ -16,12 +16,15 @@ runnable regardless of whether that shared fixture gets built later.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 
+from analysis.api_abstraction import SocialProviderError, SocialReasonCode
 from analysis.providers.twitterapi_io import TwitterApiIoProvider
+from analysis.social_engine import SocialEngine
 
 
 def _fake_response(status: int, json_body: dict | None = None, text_body: str = "") -> MagicMock:
@@ -85,7 +88,51 @@ async def test_raises_after_exhausting_all_attempts() -> None:
     provider = TwitterApiIoProvider(session=session, api_key="k")
 
     with patch("asyncio.sleep", new=AsyncMock()):
-        with pytest.raises(RuntimeError, match="failed after 3 attempts"):
+        with pytest.raises(SocialProviderError, match="failed after 3 attempts") as raised:
             await provider._get("/twitter/user/info", {"userName": "x"})
 
+    assert raised.value.reason_code is SocialReasonCode.TRANSPORT_ERROR
+    assert session.get.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_missing_api_key_is_classified_without_a_network_request() -> None:
+    session = MagicMock(spec=aiohttp.ClientSession)
+    provider = TwitterApiIoProvider(session=session, api_key=" ")
+
+    with pytest.raises(SocialProviderError) as raised:
+        await provider._get("/twitter/user/info", {"userName": "x"})
+
+    assert raised.value.reason_code is SocialReasonCode.NO_API_KEY
+    session.get.assert_not_called()
+    result = await SocialEngine(provider).analyze("SampleMemeCoin")
+    assert result.degraded is True
+    assert result.reason_code is SocialReasonCode.NO_API_KEY
+    session.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_status_is_preserved_after_retries() -> None:
+    session = _session_returning(*[_fake_response(429, text_body="rate limited") for _ in range(3)])
+    provider = TwitterApiIoProvider(session=session, api_key="k")
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(SocialProviderError) as raised:
+            await provider._get("/twitter/user/info", {"userName": "x"})
+
+    assert raised.value.reason_code is SocialReasonCode.RATE_LIMITED
+    assert session.get.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_preserved_after_retries() -> None:
+    session = MagicMock(spec=aiohttp.ClientSession)
+    session.get = MagicMock(side_effect=[asyncio.TimeoutError() for _ in range(3)])
+    provider = TwitterApiIoProvider(session=session, api_key="k")
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(SocialProviderError) as raised:
+            await provider._get("/twitter/user/info", {"userName": "x"})
+
+    assert raised.value.reason_code is SocialReasonCode.PROVIDER_TIMEOUT
     assert session.get.call_count == 3
